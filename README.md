@@ -135,3 +135,143 @@ pytest tests/
 ## 📜 许可证
 
 本项目基于 MIT License 开源。
+
+
+English README
+# Multi-Modal-LLM-Research-Assistant-for-Finance
+
+A **multi-modal LLM assistant** designed for **financial research and analysis**. It supports financial report parsing, data collection, question answering, signal extraction, and backtesting. The project integrates **Natural Language Processing, Information Extraction, RAG (Retrieval-Augmented Generation), and multi-modal inputs**, aiming to provide efficient data insights for finance professionals and researchers.
+
+---
+
+## 🚀 Features
+
+* **Data Collection**: Automatically fetch company filings and financial reports from public sources (e.g., SEC EDGAR, CSV files).
+* **Data Preprocessing**: Clean and parse financial reports and structured tables into standardized formats.
+* **Question Answering (QA)**: RAG-powered natural language Q\&A system leveraging the knowledge base.
+* **Signal Generation**: Extract investment-related signals from reports and market data.
+* **Backtesting**: Validate signals historically to evaluate strategy effectiveness.
+* **Multi-modal Support**: Integrates text, structured data, and heterogeneous sources.
+
+---
+
+## 📂 Project Structure
+
+```
+configs/                 # Configuration files
+data/  
+  ├─ processed/          # Processed data  
+  ├─ qa/                 # QA datasets  
+  ├─ companies.csv       # Company list  
+docker/                  # Docker setup  
+notebooks/               # Jupyter Notebook examples  
+scripts/                 # Helper scripts  
+src/  
+  ├─ backtest/           # Backtesting logic  
+  ├─ common/             # Shared utilities  
+  ├─ embed/              # Embedding generation  
+  ├─ index/              # Index building  
+  ├─ ingest/             # Data ingestion & preprocessing  
+  ├─ parse/              # Parsing financial text/reports  
+  ├─ rag/                # Retrieval-Augmented Generation module  
+  ├─ signals/            # Signal extraction and processing  
+  ├─ cli.py              # CLI entry point  
+  ├─ utils.py            # General utilities  
+tests/                   # Unit tests  
+requirements.txt         # Dependencies  
+Makefile                 # Automation commands  
+demo.ipynb               # Demo Notebook  
+```
+
+---
+
+## ⚙️ Installation & Setup
+
+### 1. Clone Repository
+
+```bash
+git clone https://github.com/your-username/Multi-Modal-LLM-Research-Assistant-for-Finance.git
+cd Multi-Modal-LLM-Research-Assistant-for-Finance
+```
+
+### 2. Create Virtual Environment & Install Dependencies
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 3. Configure Environment Variables
+
+Set API keys (e.g., OpenAI, financial data APIs) in `.env` or `configs/`.
+
+---
+
+## 🛠 Usage
+
+### Run from CLI
+
+```bash
+python src/cli.py --task ingest --input data/companies.csv
+```
+
+### Data Collection
+
+```bash
+python scripts/data_collection.py
+```
+
+### Data Parsing
+
+```bash
+python scripts/data_parsing.py
+```
+
+### SEC EDGAR Post-processing
+
+```bash
+python scripts/postprocess_edgar.py
+```
+
+### Backtesting Example
+
+```bash
+python -m src.backtest.run --config configs/backtest.yaml
+```
+
+---
+
+## 📊 Examples
+
+* `demo.ipynb` includes:
+
+  * Downloading SEC EDGAR filings
+  * Extracting key financial metrics
+  * QA system demonstration
+  * Signal generation & backtesting pipeline
+
+---
+
+## ✅ Testing
+
+Run unit tests:
+
+```bash
+pytest tests/
+```
+
+---
+
+## 🛤️ Roadmap
+
+* [ ] Expand multi-modal input (charts / financial image recognition)
+* [ ] Improve RAG retrieval & embeddings
+* [ ] Extend factor library for backtesting
+* [ ] Provide API + Web front-end demo
+
+---
+
+## 📜 License
+
+This project is licensed under the MIT License.
