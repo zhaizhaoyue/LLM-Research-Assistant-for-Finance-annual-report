@@ -1,3 +1,8 @@
+'''
+
+table_normalize 是 语义归一化，确保不同公司的财报表格用同一套指标名称。
+
+'''
 import argparse, re, json, sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple

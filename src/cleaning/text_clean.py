@@ -1,4 +1,10 @@
-# Write an upgraded text_clean.py that supports input/output directories and config-based defaults
+'''
+这一层主要解决的是 数据格式问题，而不是语义问题。
+清理完的表格再交给 table_normalize 做指标标准化。
+一句话总结：table_clean 是 格式清洗，确保表格能被正确解析和计算。
+'''
+
+
 from pathlib import Path
 code = r"""
 #!/usr/bin/env python3
@@ -268,6 +274,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-p = Path("/mnt/data/text_clean_v2.py")
-p.write_text(code, encoding="utf-8")
-print(f"Wrote {p}")
+
