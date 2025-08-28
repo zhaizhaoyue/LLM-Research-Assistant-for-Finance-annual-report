@@ -6,7 +6,9 @@ BASE = Path("data/raw_reports/sec-edgar-filings")
 OUT  = Path("data/raw_reports/standard")
 OUT.mkdir(parents=True, exist_ok=True)
 
-def pick_main_file(folder: Path):
+
+def pick_main_html(folder: Path):
+    """选择 HTML 主文件"""
     htmls = list(folder.glob("*.htm")) + list(folder.glob("*.html"))
     htmls = [p for p in htmls if "filing-details" not in p.name.lower()]
     if htmls:
@@ -22,13 +24,18 @@ def pick_main_file(folder: Path):
         return fs
 
     any_html = list(folder.glob("*.htm")) + list(folder.glob("*.html"))
-    if any_html: return any_html[0]
+    if any_html:
+        return any_html[0]
+
     any_txt = list(folder.glob("*.txt"))
-    if any_txt: return any_txt[0]
+    if any_txt:
+        return any_txt[0]
+
     return None
 
 
 def get_filing_date_and_year(folder: Path, main_file: Path):
+    """获取申报日期和年份"""
     meta = folder / "metadata.json"
     if meta.exists():
         try:
@@ -39,7 +46,7 @@ def get_filing_date_and_year(folder: Path, main_file: Path):
         except Exception:
             pass
 
-    if main_file.suffix.lower() in {".htm", ".html"}:
+    if main_file and main_file.suffix.lower() in {".htm", ".html"}:
         try:
             soup = BeautifulSoup(main_file.read_text(encoding="utf-8", errors="ignore"), "lxml")
             text = soup.get_text(" ", strip=True)
@@ -57,34 +64,57 @@ def get_filing_date_and_year(folder: Path, main_file: Path):
     return None, "0000"
 
 
+def pick_all_xmls(folder: Path):
+    """返回该申报目录下的所有 XML/XBRL 文件（排除 FilingSummary.xml）"""
+    xmls = list(folder.glob("*.xml")) + list(folder.glob("*.xbrl"))
+    return [x for x in xmls if x.name.lower() != "filingsummary.xml"]
+
+
 def run():
     if not BASE.exists():
         print(f"❌ not found: {BASE}")
         return
     count = 0
+
     for ticker_dir in BASE.iterdir():
-        if not ticker_dir.is_dir(): 
+        if not ticker_dir.is_dir():
             continue
         ticker = ticker_dir.name
+
         for form_dir in ticker_dir.iterdir():
-            if not form_dir.is_dir(): 
+            if not form_dir.is_dir():
                 continue
             form = form_dir.name
+
             for acc_dir in form_dir.iterdir():
-                if not acc_dir.is_dir(): 
+                if not acc_dir.is_dir():
                     continue
-                main_file = pick_main_file(acc_dir)
+
+                # 1. 处理 HTML 主文件
+                main_file = pick_main_html(acc_dir)
                 if not main_file:
                     print(f"[skip] no main file: {acc_dir}")
                     continue
+
                 filing_date, year = get_filing_date_and_year(acc_dir, main_file)
                 accno = acc_dir.name.replace("/", "_")
+
                 ext = main_file.suffix.lower().lstrip(".") or "txt"
                 dst = OUT / f"US_{ticker}_{year}_{form}_{accno}.{ext}"
                 shutil.copy2(main_file, dst)
                 count += 1
-                print(f"[ok] {dst}")
+                print(f"[ok-html] {dst}")
+
+                # 2. 处理 XML/XBRL 文件（排除 FilingSummary）
+                for xml_file in pick_all_xmls(acc_dir):
+                    ext_xml = xml_file.suffix.lower().lstrip(".") or "xml"
+                    dst_xml = OUT / f"US_{ticker}_{year}_{form}_{accno}_{xml_file.stem}.{ext_xml}"
+                    shutil.copy2(xml_file, dst_xml)
+                    count += 1
+                    print(f"[ok-xml] {dst_xml}")
+
     print(f"✅ 完成重命名/复制：{count} 文件")
+
 
 if __name__ == "__main__":
     run()

@@ -8,9 +8,6 @@ from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from sec_edgar_downloader import Downloader
 
-# ------------------------------
-# 路径与常量
-# ------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 QA_DIR = ROOT_DIR / "data" / "qa"
 QA_DIR.mkdir(parents=True, exist_ok=True)
@@ -19,6 +16,12 @@ COMPANIES_CSV = ROOT_DIR / "data" / "companies.csv"
 
 USER_AGENT_TMPL = "{company} ({email})"
 
+TICKER_CIK_HARDCODE = {
+    "BRK-A": "0001067983",
+    "BRK.B": "0001067983",
+    "BRK-B": "0001067983",
+    "BRK.A": "0001067983",
+}
 
 AGENT_CIKS = {
     "0000950170",  # 常见代理
@@ -89,10 +92,24 @@ def _read_metadata(folder: Path) -> dict:
 _SEC_TICKERS_CACHE = None
 
 def _resolve_cik_from_ticker(ticker: str, company_name: str, email: str) -> Optional[str]:
-    """通过 SEC 的 company_tickers.json 反查发行人 CIK（返回 10 位零填充字符串）"""
     global _SEC_TICKERS_CACHE
     if not ticker:
         return None
+    key0 = ticker.upper()
+    if key0 in TICKER_CIK_HARDCODE:
+        return TICKER_CIK_HARDCODE[key0]
+    key = key0.replace("-", ".")
+    if key in TICKER_CIK_HARDCODE:
+        return TICKER_CIK_HARDCODE[key]
+
+    # 先查硬映射
+    t_upper = ticker.upper()
+    if t_upper in TICKER_CIK_HARDCODE:
+        return TICKER_CIK_HARDCODE[t_upper]
+    t_norm = t_upper.replace("-", ".")
+    if t_norm in TICKER_CIK_HARDCODE:
+        return TICKER_CIK_HARDCODE[t_norm]
+
     try:
         if _SEC_TICKERS_CACHE is None:
             sess = _requests_session()
@@ -100,18 +117,26 @@ def _resolve_cik_from_ticker(ticker: str, company_name: str, email: str) -> Opti
                 "User-Agent": USER_AGENT_TMPL.format(company=company_name, email=email),
                 "Accept": "application/json,*/*"
             }
+            # 先尝试官方 company_tickers.json
             url = "https://www.sec.gov/files/company_tickers.json"
             j = _fetch_json(url, headers=headers, session=sess)
-            # 该 JSON 是 {"0": {...}, "1": {...}, ...} 的字典
-            _SEC_TICKERS_CACHE = {
-                str(v.get("ticker", "")).upper(): str(v.get("cik_str", "")).zfill(10)
-                for v in (j or {}).values()
-            }
-        # 处理 BRK-A / BRK.A 归一化：把 '-' 改成 '.'
-        key = ticker.upper().replace("-", ".")
-        return _SEC_TICKERS_CACHE.get(key)
+            if j:
+                _SEC_TICKERS_CACHE = {}
+                for v in j.values():
+                    _SEC_TICKERS_CACHE[str(v.get("ticker","")).upper()] = str(v.get("cik_str","")).zfill(10)
+                    _SEC_TICKERS_CACHE[str(v.get("ticker","")).upper().replace("-", ".")] = str(v.get("cik_str","")).zfill(10)
+            else:
+                _SEC_TICKERS_CACHE = {}
+
+        # 查两次键：原样 & 规范化
+        for k in (t_upper, t_norm):
+            v = _SEC_TICKERS_CACHE.get(k)
+            if v:
+                return v
     except Exception:
-        return None
+        pass
+    return None
+
 
 def _extract_issuer_cik(meta: dict, folder: Path, *, ticker: Optional[str], company_name: str, email: str) -> Optional[str]:
     """尽量拿到发行人 CIK，拒绝常见代理 CIK；必要时通过 ticker 反查。"""
