@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 import argparse, json, os, re, sys
+from arelle import Cntlr, FileSource
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+from decimal import Decimal, InvalidOperation
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pandas as pd
 # ---------------- filename regex ----------------
-DASH_CLASS = r"\-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −(math minus)
-ACCNO_SEARCH_RE = re.compile(
-    rf"(?<!\d)(\d{{10}})[{DASH_CLASS}](\d{{2}})[{DASH_CLASS}](\d{{6}})(?!\d)"
-)
+DASH_CLASS = r"\-\u2010\u2011\u2012\u2013\u2014\u2212"  # -, ‐, -, ‒, –, —, −
+ACCNO_SEARCH_RE = re.compile(rf"(?<!\d)(\d{{10}})[{DASH_CLASS}](\d{{2}})[{DASH_CLASS}](\d{{6}})(?!\d)")
 FORM_RE  = re.compile(r"\b(10-K|10-Q|20-F|40-F|8-K)\b", re.I)
 DATE8_RE = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 
@@ -66,14 +68,74 @@ def _try_import_cfg():
 
 _cfg_get, _path_join = _try_import_cfg()
 
-# ---------------- arelle import ----------------
-try:
-    from arelle import Cntlr, FileSource
-except Exception as e:
-    raise SystemExit("请先安装 arelle-release: pip install arelle-release\n" + str(e))
-
-# ---------------- filename regex ----------------
+# ---------------- helpers: file meta ----------------
 ACCNO_RE = re.compile(r"\b\d{10}-\d{2}-\d{6}\b")
+FORM_SET = {"10-K","10-Q","20-F","40-F","8-K"}
+
+
+def normalize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
+    """将 DataFrame 中 pyarrow 不友好的类型转为可写 Parquet 的类型。
+    - Decimal -> str（保留精度；如需数值计算可改成 float）
+    - dict/list -> JSON 字符串
+    - 统一部分文本列为 string dtype
+    """
+    df = df.copy()
+
+    # 1) Decimal 列 -> str（保精度）
+    def dec_to_str(x):
+        return str(x) if isinstance(x, Decimal) else x
+
+    if "value" in df.columns:
+        df["value"] = df["value"].apply(dec_to_str)
+
+    # 若 value_num 里也可能混入 Decimal（通常不会），也转一下
+    if "value_num" in df.columns:
+        df["value_num"] = df["value_num"].apply(
+            lambda x: float(x) if isinstance(x, Decimal) else x
+        )
+
+    # 2) dict/list（如 context）-> JSON 字符串
+    def to_json_if_needed(x):
+        return json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x
+
+    if "context" in df.columns:
+        df["context"] = df["context"].apply(to_json_if_needed)
+
+    # 3) 统一一些文本列类型，避免混合类型触发推断问题
+    textish = ["label_text", "period_label", "statement_hint", "unitRef", "decimals",
+               "qname", "ticker", "form", "year", "accno", "doc_date", "source_path", "context_id", "value_display"]
+    for col in textish:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    return df
+
+def to_parquet_with_decimal(df: pd.DataFrame, out_path: Path):
+    # 推断小数精度，保险起见统一给个较大的 scale/precision
+    # 常用：precision=38, scale=10（自行按你的数据调整）
+    schema_fields = []
+    for col in df.columns:
+        if col == "value":
+            schema_fields.append(pa.field(col, pa.decimal128(38, 10)))
+        elif col == "context":
+            schema_fields.append(pa.field(col, pa.string()))
+        else:
+            # 交给 from_pandas 推断
+            pass
+
+    # 先把 context 转成 json 字符串
+    df2 = df.copy()
+    if "context" in df2.columns:
+        df2["context"] = df2["context"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x)
+
+    # 再构建 Arrow Table
+    table = pa.Table.from_pandas(df2, preserve_index=False)
+    # 可选：如果需要强制 cast
+    # table = table.set_column(table.schema.get_field_index("value"),
+    #                          "value",
+    #                          pa.compute.cast(table.column("value"), pa.decimal128(38,10)))
+
+    pq.write_table(table, out_path)
 
 
 def sniff_meta(p: Path) -> Dict[str, Any]:
@@ -85,11 +147,7 @@ def sniff_meta(p: Path) -> Dict[str, Any]:
         "source_path": str(p),
     }
 
-    # 1) accno / form / docdate
-    m_acc = ACCNO_SEARCH_RE.search(name)
-    if not m_acc:
-        # 再试整个路径（有时上游会把 accno 放到父目录名里）
-        m_acc = ACCNO_SEARCH_RE.search(str(p))
+    m_acc = ACCNO_SEARCH_RE.search(name) or ACCNO_SEARCH_RE.search(str(p))
     if m_acc:
         meta["accno"] = f"{m_acc.group(1)}-{m_acc.group(2)}-{m_acc.group(3)}"
 
@@ -101,13 +159,11 @@ def sniff_meta(p: Path) -> Dict[str, Any]:
     if dates:
         meta["doc_date"] = dates[-1].group(1)
 
-    # 2) 基于位置推断 ticker/year，允许连字符和点
     tokens = base.split("_")
     if tokens and tokens[0].upper() == "US":
         tokens = tokens[1:]
 
     def looks_ticker(tok: str) -> bool:
-        # 允许字母数字、点和连字符，最多 12 位
         return bool(re.fullmatch(r"[A-Z0-9.\-]{1,12}", tok))
 
     if len(tokens) >= 1 and looks_ticker(tokens[0].upper()):
@@ -116,11 +172,10 @@ def sniff_meta(p: Path) -> Dict[str, Any]:
     if len(tokens) >= 2 and tokens[1].isdigit() and len(tokens[1]) == 4:
         meta["year"] = tokens[1]
 
-    # 3) 派生 fy/fq/year
     if not meta.get("year") and meta.get("doc_date"):
         meta["year"] = meta["doc_date"][:4]
 
-    if meta.get("year") and meta["year"].isdigit():
+    if meta.get("year") and str(meta["year"]).isdigit():
         meta["fy"] = int(meta["year"])
 
     if meta.get("doc_date"):
@@ -132,10 +187,6 @@ def sniff_meta(p: Path) -> Dict[str, Any]:
 
     return meta
 
-
-
-FORM_SET = {"10-K","10-Q","20-F","40-F","8-K"}
-
 def sniff_from_parents(p: Path) -> Dict[str, Any]:
     parts = list(p.parts)
     up = [s.upper() for s in parts]
@@ -144,7 +195,6 @@ def sniff_from_parents(p: Path) -> Dict[str, Any]:
         if seg in FORM_SET:
             if i > 0 and re.fullmatch(r"[A-Z0-9.\-]{1,12}", up[i-1]):
                 out["ticker"] = up[i-1]
-            # 先直接试下一个段是不是 accno；否则扫描整段
             if i + 1 < len(parts):
                 seg_next = parts[i+1]
                 m_acc = ACCNO_SEARCH_RE.fullmatch(seg_next) or ACCNO_SEARCH_RE.search(seg_next)
@@ -164,10 +214,8 @@ def enrich_meta_from_dei(model_xbrl, meta: Dict[str, Any]) -> Dict[str, Any]:
     import re
 
     def qname_localname(qn) -> Optional[str]:
-        # qn 可能是 arelle.ModelValue.QName；优先用 localName
         if hasattr(qn, "localName") and qn.localName:
             return qn.localName
-        # 退路：从字符串里解析，兼容 "{ns}Local" 或 "prefix:Local"
         if qn is not None:
             s = str(qn)
             if "}" in s and s.startswith("{"):
@@ -200,14 +248,13 @@ def enrich_meta_from_dei(model_xbrl, meta: Dict[str, Any]) -> Dict[str, Any]:
 
     if not meta.get("form") and form:
         fup = form.upper()
-        m = re.search(r"(10-K|10-Q|20-F|40-F|8-K)", fup)   # 兼容 "10-Q/A" 等
+        m = re.search(r"(10-K|10-Q|20-F|40-F|8-K)", fup)   # 兼容 "10-Q/A"
         if m:
             meta["form"] = m.group(1)
 
     if not meta.get("doc_date") and dped and re.fullmatch(r"\d{4}-\d{2}-\d{2}", dped):
         meta["doc_date"] = dped.replace("-", "")
 
-    # FY / FQ
     if not meta.get("fy"):
         if fy_s and fy_s.isdigit():
             meta["fy"] = int(fy_s)
@@ -228,27 +275,27 @@ def enrich_meta_from_dei(model_xbrl, meta: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-    # ★ 确保 year 有值（目录用的是 year）
     if not meta.get("year") and meta.get("fy"):
         meta["year"] = str(meta["fy"])
 
     return meta
 
-
-
 # ---------------- arelle helpers ----------------
+from arelle import Cntlr, FileSource
+
 def load_instance(ctrl: Cntlr.Cntlr, file_path: str):
     mm = ctrl.modelManager
     try:
         model_xbrl = mm.load(file=file_path)
         if model_xbrl: return model_xbrl
-    except TypeError: pass
+    except TypeError:
+        pass
     fs = FileSource.openFileSource(file_path, ctrl)
     model_xbrl = mm.load(fs)
     fs.close()
     return model_xbrl
 
-def fact_qname(f): 
+def fact_qname(f) -> str:
     qn = getattr(getattr(f,"concept",None),"qname",None) or getattr(f,"qname",None)
     return str(qn) if qn else ""
 
@@ -256,13 +303,112 @@ def fact_value_num(f):
     xv = getattr(f,"xValue",None)
     return xv if xv is not None and not isinstance(xv,str) else None
 
+def to_iso(dt) -> Optional[str]:
+    if not dt: return None
+    if hasattr(dt, "isoformat"):
+        return dt.isoformat()[:10]
+    s = str(dt)
+    return s[:10] if re.fullmatch(r"\d{4}\-\d{2}\-\d{2}.*", s) else s
+
 def fact_period(f):
     ctx = getattr(f,"context",None)
-    if ctx is None: return None,None,None
-    to_iso = lambda dt: (dt.isoformat()[:10] if hasattr(dt,"isoformat") else str(dt)) if dt else None
+    if ctx is None:
+        return None,None,None
     if getattr(ctx,"startDatetime",None) or getattr(ctx,"endDatetime",None) or getattr(ctx,"instantDatetime",None):
         return to_iso(ctx.startDatetime), to_iso(ctx.endDatetime), to_iso(ctx.instantDatetime)
-    return ctx.startDate, ctx.endDate, ctx.instantDate
+    return getattr(ctx,"startDate",None), getattr(ctx,"endDate",None), getattr(ctx,"instantDate",None)
+
+def context_to_dict(ctx) -> Dict[str, Any]:
+    if ctx is None:
+        return {"entity": None, "period": {"start_date": None, "end_date": None, "instant": None}, "dimensions": {}}
+    # entity
+    ent = None
+    try:
+        scheme, ident = ctx.entityIdentifier
+        ent = ident or None
+    except Exception:
+        ent = None
+    # period
+    ps, pe, inst = fact_period(type("F", (), {"context": ctx}))
+    period = {"start_date": ps, "end_date": pe, "instant": inst}
+    # dimensions
+    dims: Dict[str,str] = {}
+    try:
+        qd = getattr(ctx, "qnameDims", {}) or {}
+        for dim_qn, mem in qd.items():
+            dim = str(dim_qn)
+
+            mem_qn = getattr(mem, "memberQname", None)
+            if mem_qn is None:
+                mem_qn = getattr(mem, "typedMember", None)
+            if mem_qn is None:
+                mem_qn = getattr(mem, "qname", None)
+
+            if hasattr(mem_qn, "qname"):            # arelle 的维度成员对象
+                mem_str = str(getattr(mem_qn, "qname"))
+            elif hasattr(mem_qn, "prefixedName"):   # 某些类型有 prefixedName
+                mem_str = str(mem_qn.prefixedName)
+            else:
+                mem_str = str(mem_qn) if mem_qn is not None else ""
+
+            dims[str(dim)] = mem_str
+    except Exception:
+        pass
+    return {"entity": ent, "period": period, "dimensions": dims}
+
+def unit_to_str(u) -> Optional[str]:
+    if u is None:
+        return None
+    try:
+        # arelle unit 可能是 measures[0] / measures[1] 分子分母
+        measures = getattr(u, "measures", None)
+        if measures:
+            num = measures[0] if len(measures) > 0 else []
+            den = measures[1] if len(measures) > 1 else []
+            def _fmt(lst):
+                return "*".join([str(x) for x in lst]) if lst else ""
+            s = _fmt(num)
+            if den:
+                s = s + "/" + _fmt(den)
+            return s or getattr(u, "id", None)
+        # 退回 id
+        return getattr(u, "id", None)
+    except Exception:
+        return getattr(u, "id", None)
+
+def concept_label_text(f, lang_priority=("en","en-US","en-GB")) -> Optional[str]:
+    try:
+        c = getattr(f, "concept", None)
+        if c is None: return None
+        # standard label role
+        for lang in lang_priority:
+            lbl = c.label(lang=lang)  # arelle 会按标准 role 查
+            if lbl: return str(lbl).strip()
+        # 退路：不指明语言
+        lbl = c.label()
+        return str(lbl).strip() if lbl else None
+    except Exception:
+        return None
+
+def guess_statement_hint(qname_str: str) -> str:
+    s = qname_str.lower()
+    if any(k in s for k in ["revenue","income","earnings","profit","loss","eps"]):
+        return "income"
+    if any(k in s for k in ["asset","liabilit","equity","payable","receivable","inventory","goodwill"]):
+        return "balance"
+    if any(k in s for k in ["cash", "operatingactivities", "investingactivities", "financingactivities"]):
+        return "cashflow"
+    if any(k in s for k in ["disclosure","note","supplemental","schedule"]):
+        return "notes"
+    return "other"
+
+def period_label_builder(year: Optional[str|int], ps, pe, inst) -> Optional[str]:
+    fy = f"FY{year}" if year else "FY?"
+    if inst:
+        return f"{fy} instant {inst}"
+    if ps or pe:
+        return f"{fy} {ps or '?'} — {pe or '?'}"
+    return None
 
 def iter_instance_files(indir: Path) -> List[Path]:
     cands = []
@@ -274,59 +420,113 @@ def iter_instance_files(indir: Path) -> List[Path]:
             cands.append(p)
     return cands
 
-# ---------------- main parse ----------------
+# ---------------- main parse (REWRITTEN) ----------------
 def parse_one(file_path: Path) -> pd.DataFrame:
     ctrl = Cntlr.Cntlr(logFileName=None)
     mx = load_instance(ctrl, str(file_path))
     rows = []
-# 1) 文件名
-    base_meta = sniff_meta(file_path)
 
-# 2) 父目录兜底
+    # 1) 文件名/路径推断 + 2) 父目录兜底 + 3) DEI 兜底
+    base_meta = sniff_meta(file_path)
     pmeta = sniff_from_parents(file_path)
     for k, v in pmeta.items():
         if not base_meta.get(k) and v:
             base_meta[k] = v
-
-# 3) DEI 兜底（需要在已加载 model_xbrl 后执行）
     base_meta = enrich_meta_from_dei(mx, base_meta)
 
-# （可选调试）若仍缺失，打印一次文件名
     if not base_meta.get("ticker") or not base_meta.get("form") or not base_meta.get("accno"):
         print(f"[dbg] meta incomplete -> {file_path.name} -> {base_meta}")
 
+    # 4) 遍历事实，收集所需字段
     for f in mx.facts:
-        if getattr(f,"isNil",False): continue
-        ps,pe,inst = fact_period(f)
-        row = {
-            "concept": fact_qname(f),
-            "value_raw": getattr(f,"value",None),
-            "value_num": fact_value_num(f),
-            "period_start": ps, "period_end": pe, "instant": inst,
-            **base_meta
-        }
+        if getattr(f,"isNil",False):
+            continue
+
+        # 基本
+        qname = fact_qname(f)
+        ctx   = getattr(f, "context", None)
+        unit  = getattr(f, "unit", None)
+
+        # 值
+        value_raw = getattr(f, "value", None)
+        value_num = fact_value_num(f)
+        # value_display：始终字符串（便于 UI 显示）
+        value_display = None if value_raw is None else str(value_raw).strip()
+
+        # value：优先数值（Decimal），否则原串
+        value: Any = None
+        if value_num is not None:
+            try:
+                value = Decimal(str(value_num))
+            except (InvalidOperation, ValueError):
+                value = value_num
+        else:
+            if value_raw is not None:
+                s = str(value_raw).strip()
+                # 尝试把纯数字字符串转 Decimal
+                try:
+                    value = Decimal(s.replace(",", ""))
+                except (InvalidOperation, ValueError):
+                    value = s
+
+        # period
+        ps, pe, inst = fact_period(f)
+
+        # 组织 context 字段
+        ctx_dict = context_to_dict(ctx)
+        context_id = getattr(ctx, "id", None) if ctx is not None else None
+
+        # 其他
+        unit_ref  = unit_to_str(unit)
+        decimals  = getattr(f, "decimals", None)
+        label_txt = concept_label_text(f)
+        stmt_hint = guess_statement_hint(qname)
+        per_label = period_label_builder(base_meta.get("year"), ps, pe, inst)
+
+        row = dict(
+            # —— 你要求保留的核心字段 ——
+            qname=qname,
+            value=value,
+            unitRef=unit_ref,
+            decimals=decimals,
+            context_id=context_id,
+            context=ctx_dict,
+            label_text=label_txt,
+            period_label=per_label,
+            statement_hint=stmt_hint,
+            value_raw=value_raw,
+            value_num=value_num,
+            value_display=value_display,
+
+            # —— 元数据（溯源/RAG 过滤） ——
+            ticker=(base_meta.get("ticker") or None),
+            form=(base_meta.get("form") or None),
+            year=(str(base_meta.get("year")) if base_meta.get("year") else None),
+            accno=(base_meta.get("accno") or None),
+            doc_date=(base_meta.get("doc_date") or None),
+            source_path=str(file_path),
+        )
         rows.append(row)
+
     mx.close()
     return pd.DataFrame(rows)
 
+# ---------------- CLI & export ----------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="indir", default=None)
-    ap.add_argument("--out", dest="outdir", default=None)
-    ap.add_argument(
-    "--to",
-    dest="fmt",
-    nargs="+",                                 # 支持多选：--to parquet jsonl
-    choices=["parquet","csv","jsonl"],
-    default=["parquet","jsonl"]                # ★ 默认：点击运行就导出 parquet + jsonl
-    )
+    ap = argparse.ArgumentParser(description="Parse XBRL with arelle → Silver-ready facts")
+    ap.add_argument("--in", dest="indir", default=None, help="Input root (raw_reports/standard)")
+    ap.add_argument("--out", dest="outdir", default=None, help="Output root (processed)")
+    ap.add_argument("--to", dest="fmt", nargs="+", choices=["parquet","csv","jsonl"],
+                    default=["parquet","jsonl"])
+    ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
     raw_in  = _cfg_get("data.raw_reports.standard", "${project_root}/data/raw_reports/standard")
     raw_out = _cfg_get("data.processed", "${project_root}/data/processed")
 
-    indir  = Path(args.indir).resolve() if args.indir else Path(raw_in.replace("${project_root}", str(Path(__file__).resolve().parents[2]))).resolve()
-    outdir = Path(args.outdir).resolve() if args.outdir else Path(raw_out.replace("${project_root}", str(Path(__file__).resolve().parents[2]))).resolve()
+    prj_root = Path(__file__).resolve().parents[2]
+    indir  = Path(args.indir).resolve() if args.indir else Path(raw_in.replace("${project_root}", str(prj_root))).resolve()
+    outdir = Path(args.outdir).resolve() if args.outdir else Path(raw_out.replace("${project_root}", str(prj_root))).resolve()
 
     files = iter_instance_files(indir)
     if not files:
@@ -336,12 +536,12 @@ def main():
         try:
             df = parse_one(fp)
         except Exception as e:
-            print(f"[fail] {fp.name}: {e}")
+            print(f"[fail] {fp.name}: {e}", file=sys.stderr)
             continue
         if df.empty:
             continue
 
-    # ✅ 从解析后的 DataFrame 拿元数据（已经过 DEI/父目录兜底）
+        # 以解析后的 DataFrame 拿元数据（已 DEI 兜底）
         def first_nonnull(df, col, default=None):
             if col in df.columns:
                 s = df[col].dropna()
@@ -349,17 +549,14 @@ def main():
                     return str(s.iloc[0])
             return default
 
-        # 在保存循环里改成这样：
         ticker = first_nonnull(df, "ticker", "UNKNOWN").upper()
-
         year = first_nonnull(df, "year", None)
         if not year:
-            fy = first_nonnull(df, "fy", None)
-            year = str(fy) if fy else "NA"
+            fy = first_nonnull(df, "doc_date", None)
+            year = fy[:4] if fy else "NA"
 
         form = first_nonnull(df, "form", None)
         if not form:
-            # 再试一次用文件名快速猜
             m_form = FORM_RE.search(Path(fp).name)
             form = m_form.group(1).upper() if m_form else "NA"
         else:
@@ -372,19 +569,25 @@ def main():
 
         fmts = [f.lower() for f in (args.fmt or ["parquet","jsonl"])]
         for fmt in fmts:
+            df_to_save = df
+            if fmt in ("parquet", "csv"):
+                df_to_save = normalize_for_parquet(df)
+
             if fmt == "parquet":
                 out_path = out_dir / "facts.parquet"
-                df.to_parquet(out_path, index=False)
+                df_to_save.to_parquet(out_path, index=False)
             elif fmt == "csv":
                 out_path = out_dir / "facts.csv"
-                df.to_csv(out_path, index=False, encoding="utf-8")
+                df_to_save.to_csv(out_path, index=False, encoding="utf-8")
             elif fmt == "jsonl":
                 out_path = out_dir / "facts.jsonl"
+                # JSONL 可以保留原 df，这样 Decimal 会被自动序列化为字符串；如果你想统一也可用 df_to_save
                 df.to_json(out_path, orient="records", lines=True, force_ascii=False)
             else:
                 raise ValueError(f"Unknown format: {fmt}")
 
-            print(f"[ok] saved {len(df)} facts -> {out_path}")
+            if not args.quiet:
+                print(f"[ok] saved {len(df)} facts -> {out_path}")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
