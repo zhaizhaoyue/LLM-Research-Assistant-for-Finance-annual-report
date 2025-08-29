@@ -102,8 +102,12 @@ def normalize_for_parquet(df: pd.DataFrame) -> pd.DataFrame:
         df["context"] = df["context"].apply(to_json_if_needed)
 
     # 3) 统一一些文本列类型，避免混合类型触发推断问题
-    textish = ["label_text", "period_label", "statement_hint", "unitRef", "decimals",
-               "qname", "ticker", "form", "year", "accno", "doc_date", "source_path", "context_id", "value_display"]
+    textish = [
+        "label_text","period_label","statement_hint","unitRef","decimals",
+        "qname","ticker","form","year","accno","doc_date","source_path",
+        "context_id","value_display","unit_normalized","unit_family",
+        "period_type","start_date","end_date","instant","entity","dimensions_json"
+    ]
     for col in textish:
         if col in df.columns:
             df[col] = df[col].astype("string")
@@ -295,6 +299,25 @@ def load_instance(ctrl: Cntlr.Cntlr, file_path: str):
     fs.close()
     return model_xbrl
 
+def derive_period_fy(ps: Optional[str], pe: Optional[str], inst: Optional[str], fy_fallback: Optional[int]) -> Optional[int]:
+    d = inst or pe or ps
+    if d and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return int(d[:4])
+    return fy_fallback
+
+def month_to_q(mm: int) -> Optional[str]:
+    return {1:"Q1",2:"Q1",3:"Q1",4:"Q2",5:"Q2",6:"Q2",7:"Q3",8:"Q3",9:"Q3",10:"Q4",11:"Q4",12:"Q4"}.get(mm)
+
+def derive_period_fq(ps: Optional[str], pe: Optional[str], inst: Optional[str]) -> Optional[str]:
+    d = inst or pe or ps
+    if d and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        try:
+            return month_to_q(int(d[5:7]))
+        except Exception:
+            return None
+    return None
+
+
 def fact_qname(f) -> str:
     qn = getattr(getattr(f,"concept",None),"qname",None) or getattr(f,"qname",None)
     return str(qn) if qn else ""
@@ -375,6 +398,68 @@ def unit_to_str(u) -> Optional[str]:
         return getattr(u, "id", None)
     except Exception:
         return getattr(u, "id", None)
+
+UNIT_CURRENCY_PAT = re.compile(r"(iso4217:)?([A-Z]{3})(?:\b|[^A-Z])")
+UNIT_SHARE_PAT    = re.compile(r"\b(shares?|share)\b", re.I)
+UNIT_PURE_PAT     = re.compile(r"\bpure\b", re.I)
+UNIT_PERCENT_PAT  = re.compile(r"\bpercent\b", re.I)
+def normalize_unit(unit_str: Optional[str], qname_str: str, value_display: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    返回: (unit_normalized, unit_family)
+    unit_family ∈ {"currency","shares","percent","pure", None}
+    """
+    if not unit_str:
+        # 无 unit 时尝试从 qname / 文本里推断百分号
+        if value_display and "%" in value_display:
+            return "%", "percent"
+        if "percent" in qname_str.lower():
+            return "%", "percent"
+        return None, None
+
+    us = unit_str.strip()
+
+    # 货币：抓 ISO4217
+    m = UNIT_CURRENCY_PAT.search(us)
+    if m:
+        iso = m.group(2)
+        return iso.upper(), "currency"
+
+    # 股数
+    if UNIT_SHARE_PAT.search(us):
+        return "shares", "shares"
+
+    # 百分比（部分 taxonomy 会写 percent/pure）
+    if UNIT_PERCENT_PAT.search(us):
+        return "%", "percent"
+
+    # pure（无单位）
+    if UNIT_PURE_PAT.search(us):
+        # value_display 带 % 的话仍按百分比处理
+        if value_display and "%" in value_display:
+            return "%", "percent"
+        return "pure", "pure"
+
+    # 没识别出来就原样返回
+    return us, None
+
+def to_float_maybe(x) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, Decimal):
+        try:
+            return float(x)
+        except Exception:
+            return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace(",", "")
+    # 去掉尾部百分号（先不除以100，这一步只做“能转 float”）
+    if s.endswith("%"):
+        s = s[:-1]
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 def concept_label_text(f, lang_priority=("en","en-US","en-GB")) -> Optional[str]:
     try:
@@ -478,13 +563,18 @@ def parse_one(file_path: Path) -> pd.DataFrame:
 
         # 其他
         unit_ref  = unit_to_str(unit)
+        unit_norm, unit_family = normalize_unit(unit_ref, qname, value_display)
         decimals  = getattr(f, "decimals", None)
         label_txt = concept_label_text(f)
         stmt_hint = guess_statement_hint(qname)
-        per_label = period_label_builder(base_meta.get("year"), ps, pe, inst)
-
+        period_fy = derive_period_fy(ps, pe, inst, base_meta.get("fy"))
+        period_fq = derive_period_fq(ps, pe, inst)
+        # 用“期间财年”生成更准确的 label（而不是 meta year）
+        per_label = period_label_builder(period_fy, ps, pe, inst)
         row = dict(
             # —— 你要求保留的核心字段 ——
+            period_fy=period_fy,               # 由 instant / end_date 推得的“期间财年”（calendar 年）
+            period_fq=period_fq,
             qname=qname,
             value=value,
             unitRef=unit_ref,
@@ -497,7 +587,17 @@ def parse_one(file_path: Path) -> pd.DataFrame:
             value_raw=value_raw,
             value_num=value_num,
             value_display=value_display,
+            unit_normalized=unit_norm,      # 例如 "USD" / "EUR" / "shares" / "%" / "pure"
+            unit_family=unit_family, 
+            period_type = "instant" if inst else ("duration" if (ps or pe) else None),
 
+            start_date=ps,
+            end_date=pe,
+            instant=inst,
+
+            # —— 从 context 中“摊平”实体/维度，便于筛选 —— 
+            entity=ctx_dict.get("entity"),
+            dimensions=ctx_dict.get("dimensions", {}),
             # —— 元数据（溯源/RAG 过滤） ——
             ticker=(base_meta.get("ticker") or None),
             form=(base_meta.get("form") or None),
@@ -541,6 +641,34 @@ def main():
         if df.empty:
             continue
 
+        # ========== Silver → Gold 轻加工：数值与维度归档 ==========
+        # 4.1 value_num_clean：可计算的 float（百分比自动 /100）
+        df["value_num_clean"] = df.apply(
+            lambda r: to_float_maybe(r.get("value")), axis=1
+        )
+
+        # 若判定是百分比（unit_family="percent" 或 文本含 % 或 qname 含 percent）
+        percent_mask = (
+            (df["unit_family"].fillna("") == "percent")
+            | df["value_display"].fillna("").str.contains("%", regex=False)
+            | df["qname"].fillna("").str.lower().str.contains("percent")
+        )
+        df.loc[percent_mask & df["value_num_clean"].notna(), "value_num_clean"] = \
+            df.loc[percent_mask & df["value_num_clean"].notna(), "value_num_clean"] / 100.0
+
+        # 4.2 decimals：保存为 string，避免混型
+        if "decimals" in df.columns:
+            df["decimals"] = df["decimals"].astype("string")
+
+        # 4.3 维度落为 JSON 字符串，便于 Parquet/schema 统一
+        if "dimensions" in df.columns:
+            df["dimensions_json"] = df["dimensions"].apply(
+                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else (None if pd.isna(x) else str(x))
+            )
+
+        # 4.4 entity 统一 string
+        if "entity" in df.columns:
+            df["entity"] = df["entity"].astype("string")
         # 以解析后的 DataFrame 拿元数据（已 DEI 兜底）
         def first_nonnull(df, col, default=None):
             if col in df.columns:
