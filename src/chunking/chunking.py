@@ -82,64 +82,151 @@ def process_text_jsonl(
     relpath_under_input: Optional[str],
     max_tokens: int,
     overlap: int,
+    min_row_tokens: int = 6,  # 仍然保留：短行不单独成块，会与邻近行合并
     default_schema_version: str = "0.3.0",
     default_language: str = "en",
 ) -> int:
     """
-    读取文本 JSONL，滑窗切块，透传/补全元数据，输出增强字段：
-      - chunk_id: <file-stem>::row-<row_idx>::chunk-<i>
-      - chunk_index, chunk_count
-      - tokens_in_chunk, row_tokens_total, chunk_span_tokens: [start, end)
-      - source_file (绝对/相对都可), relpath (相对 input_root)
+    文本按“整文件级”滑窗切块：
+      - 逐行读取，短行(< min_row_tokens)合并到缓冲，不单独出块；
+      - 缓冲 token 数 >= max_tokens 则吐出一个 chunk；
+      - 相邻 chunk 保留 overlap token 的尾部作为上下文；
+      - 不输出原始 'tokens' 字段；增强 tokens_in_chunk / row_tokens_total / chunk_span_tokens。
     """
+    # 一些小工具
+    def toks(s: str) -> List[str]:
+        return (s or "").split()
+
+    def tok_len(s: str) -> int:
+        return len(toks(s))
+
+    # 全局缓冲（跨行）
+    buf_texts: List[str] = []          # 保存原始行文本（按行）
+    buf_tok_counts: List[int] = []     # 每行 token 数（和 buf_texts 对齐）
+    buf_total = 0                      # 缓冲累计 token 数
+    total_seen_tokens = 0              # 整个文件累计 token（用于 span 辅助理解）
+
+    # 记录一些元数据
+    first_row_meta: Optional[Dict[str, Any]] = None
+    accno_fallback: Optional[str] = None
     out_rows: List[Dict[str, Any]] = []
-    for row_idx, row in enumerate(read_jsonl(in_file)):
-        # 1) 取文本
-        txt: Optional[str] = None
-        text_key_used: Optional[str] = None
+
+    # 收集所有可用的文本行（保持原有 TEXT_FIELDS 逻辑）
+    lines: List[Tuple[str, Dict[str, Any]]] = []
+    for row in read_jsonl(in_file):
+        # 记住首行 meta 以便透传 schema/language 等
+        if first_row_meta is None:
+            first_row_meta = dict(row)
+        if not accno_fallback and row.get("accno"):
+            accno_fallback = row.get("accno")
+
+        txt = None
+        used_key = None
         for k in TEXT_FIELDS:
             v = row.get(k)
             if isinstance(v, str) and v.strip():
                 txt = v
-                text_key_used = k
+                used_key = k
                 break
         if not txt:
             continue
 
-        # 2) 切块 + 统计 token
-        chunks, spans = chunk_text(txt, max_tokens=max_tokens, overlap=overlap)
-        total_chunks = len(chunks)
-        row_tokens_total = len(_as_tokens(txt))
+        # 过滤过短的行：< min_row_tokens 的行不单独出块，先合并到缓冲中
+        if tok_len(txt) < min_row_tokens:
+            # 先入缓冲（等和邻行组成更大的上下文）
+            buf_texts.append(txt)
+            ct = tok_len(txt)
+            buf_tok_counts.append(ct)
+            buf_total += ct
+            total_seen_tokens += ct
+            continue
 
-        # 3) 通用元数据补全
-        schema_version = row.get("schema_version") or default_schema_version
-        language = row.get("language") or default_language
+        # 对于长度合适的行，先把它推进缓冲，再根据预算决策是否吐块
+        buf_texts.append(txt)
+        ct = tok_len(txt)
+        buf_tok_counts.append(ct)
+        buf_total += ct
+        total_seen_tokens += ct
 
-        # 4) 逐块写出（透传原始 metadata）
-        for i, ch in enumerate(chunks):
-            start, end = spans[i]
-            o = dict(row)  # 透传一切已有字段（ticker/fy/fq/accno/section/heading/page_no/…）
+        # 预算达标，尝试吐块（可一次吐多个，直到 buf_total < max_tokens）
+        while buf_total >= max_tokens:
+            # 1) 组装 chunk 文本（整个缓冲连接）
+            chunk_text = "\n".join(buf_texts).strip()
+            # 2) 截取头部的 max_tokens 作为这个 chunk 的正文（近似按空白 token）
+            token_list = toks(chunk_text)
+            head_tokens = token_list[:max_tokens]
+            chunk_body = " ".join(head_tokens)
+            # 3) 输出一个 chunk
+            o = dict(first_row_meta or {})
             o.pop("tokens", None)
-            o["schema_version"] = schema_version
-            o["language"] = language
+            o["schema_version"] = (o.get("schema_version") or default_schema_version)
+            o["language"] = (o.get("language") or default_language)
+            o["text"] = chunk_body
 
-            # 用 chunk 覆盖文本，并写出增强字段
-            o["text"] = ch
-            o["chunk_index"] = i
-            o["chunk_count"] = total_chunks
-            o["chunk_id"] = f"{in_file.stem}::row-{row_idx}::chunk-{i}"
+            # chunk_id 采用 accno 优先，否则用文件名
+            base = accno_fallback or in_file.stem
+            o["chunk_id"] = f"{base}::text::chunk-{len(out_rows)}"
+            o["chunk_index"] = len(out_rows)  # 先填，稍后回填 chunk_count
+            o["chunk_count"] = 0
             o["source_file"] = str(in_file)
             if relpath_under_input is not None:
                 o["relpath"] = relpath_under_input
+            o["text_field"] = "text"  # 聚合后是统一 text 输出
 
-            o["tokens_in_chunk"] = len(_as_tokens(ch))
-            o["row_tokens_total"] = row_tokens_total
-            o["chunk_span_tokens"] = [start, end]  # 方便日后重建上下文
-            o["text_field"] = text_key_used       # 记录本次使用了哪个文本字段
+            o["tokens_in_chunk"] = len(head_tokens)
+            # row_tokens_total 改为“全文件累计 token”（更符合检索统计语义）
+            # 如果你更想用“原文本总 token”，可以先把所有行连接后再算一次。
+            o["row_tokens_total"] = total_seen_tokens
+            # 这里的 span 用“全文件 token 累计”的滑动窗口近似（可选）
+            start_token = max(0, total_seen_tokens - buf_total)
+            end_token = start_token + len(head_tokens)
+            o["chunk_span_tokens"] = [start_token, end_token]
 
             out_rows.append(o)
 
+            # 4) 构建 overlap：保留尾部 overlap token，其余从左侧移除
+            keep = min(overlap, max_tokens)  # overlap 不应超过 max_tokens
+            tail_tokens = token_list[max_tokens - keep:max_tokens]  # 要保留的尾部 token
+            # 用行级近似把缓冲左侧弹出，直到只剩下 overlap 的 token 数
+            # 先把缓冲完全展开为 token，再回填为一行（简单近似）
+            # 为保持实现最小化，这里直接重建缓冲为一个“单行”的 overlap 字符串
+            buf_texts = [" ".join(tail_tokens)]
+            buf_tok_counts = [len(tail_tokens)]
+            buf_total = len(tail_tokens)
+
+    # 文件结束后，如果缓冲里还有内容，也要吐出 1 个尾块
+    if buf_total > 0 and buf_texts:
+        token_list = " ".join(buf_texts).split()
+        chunk_body = " ".join(token_list[:max_tokens])
+        o = dict(first_row_meta or {})
+        o.pop("tokens", None)
+        o["schema_version"] = (o.get("schema_version") or default_schema_version)
+        o["language"] = (o.get("language") or default_language)
+        o["text"] = chunk_body
+        base = accno_fallback or in_file.stem
+        o["chunk_id"] = f"{base}::text::chunk-{len(out_rows)}"
+        o["chunk_index"] = len(out_rows)
+        o["chunk_count"] = 0
+        o["source_file"] = str(in_file)
+        if relpath_under_input is not None:
+            o["relpath"] = relpath_under_input
+        o["text_field"] = "text"
+        o["tokens_in_chunk"] = min(len(token_list), max_tokens)
+        o["row_tokens_total"] = total_seen_tokens
+        start_token = max(0, total_seen_tokens - buf_total)
+        end_token = start_token + o["tokens_in_chunk"]
+        o["chunk_span_tokens"] = [start_token, end_token]
+        out_rows.append(o)
+
+    # 回填 chunk_count
+    total_chunks = len(out_rows)
+    for i, r in enumerate(out_rows):
+        r["chunk_index"] = i
+        r["chunk_count"] = total_chunks
+
     return write_jsonl(out_file, out_rows)
+
+
 
 def process_group_jsonl(
     in_file: Path,
@@ -161,12 +248,34 @@ def process_group_jsonl(
 
     # -------- helpers --------
     def est_edge_tokens(r: Dict[str, Any]) -> int:
-        # 非严格估算：parent/child 概念名 + 权重 + 少量上下文
-        p = (r.get("parent_concept") or "")
-        c = (r.get("child_concept") or "")
-        w = str(r.get("weight") if r.get("weight") is not None else "")
-        # 近似按空白分词
-        return len(p.split()) + len(c.split()) + len(w.split()) + 4
+        """
+        更保守的 token 估算：按字符长度近似，避免 QName 没空格导致低估。
+        经验：~4 字符 ≈ 1 token（大致），再加一些常数项。
+        """
+        parts = []
+
+        # cal
+        parts.append(r.get("parent_concept") or "")
+        parts.append(r.get("child_concept") or "")
+
+        # def
+        parts.append(r.get("from_concept") or "")
+        parts.append(r.get("to_concept") or "")
+
+        # 关联信息
+        parts.append(r.get("arcrole") or "")
+        parts.append(r.get("preferred_label") or "")
+        parts.append(r.get("linkrole") or "")
+
+        # 去掉命名空间前缀，减少长度但保留语义主体
+        s = "|".join(parts)
+        for ns in ("us-gaap:", "dei:", "srt:", "aapl:", "ifrs-full:", "xbrli:"):
+            s = s.replace(ns, "")
+
+        # 以字符长度近似 -> token，4 字符 ≈ 1 token；至少给 8，避免 0
+        approx = max(8, (len(s) // 4) + 1)
+        return approx
+
 
     def pack_with_budget(bucket: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         if not token_budget:
@@ -196,114 +305,105 @@ def process_group_jsonl(
         lr = r.get("linkrole") or "__NA__"
         buckets.setdefault(lr, []).append(r)
 
-    # -------- 2) 每桶切块 + 汇总输出 --------
+# -------- 2) 每桶切块 + 汇总输出 --------
     out_rows: List[Dict[str, Any]] = []
-    # 全局计数（用于 chunk_count；先累计所有组数）
+
+    # 先枚举所有组，确定 chunk_count
     all_groups: List[Tuple[str, List[Dict[str, Any]]]] = []
     for lr, bucket in buckets.items():
         for grp in pack_with_budget(bucket):
             all_groups.append((lr, grp))
     total = len(all_groups)
 
+    # ✅ 逐组写出（注意：以下全部代码都在这个 for 里！）
     for gidx, (lr, g) in enumerate(all_groups):
-        # 统计/聚合
         edge_count = len(g)
         tickers     = sorted({r.get("ticker") for r in g if r.get("ticker")})
         forms       = sorted({r.get("form") for r in g if r.get("form")})
         years       = sorted({r.get("year") for r in g if r.get("year") is not None})
         accnos      = sorted({r.get("accno") for r in g if r.get("accno")})
         file_types  = sorted({r.get("file_type") for r in g if r.get("file_type")})
-# 兼容 cal/def 的端点聚合（确保在此片段之前定义）
-    def _endpoints(r):
-        if "parent_concept" in r or "child_concept" in r:   # calculation_edges
-            return r.get("parent_concept"), r.get("child_concept")
-        else:                                               # definition_arcs
-            return r.get("from_concept"), r.get("to_concept")
 
-    parents  = sorted({p for p, _ in (_endpoints(r) for r in g) if p})
-    children = sorted({c for _, c in (_endpoints(r) for r in g) if c})
+        # 兼容 cal/def 的端点聚合
+        def _endpoints(r):
+            if "parent_concept" in r or "child_concept" in r:   # calculation_edges
+                return r.get("parent_concept"), r.get("child_concept")
+            else:                                               # definition_arcs
+                return r.get("from_concept"), r.get("to_concept")
 
-    arcroles   = sorted({r.get("arcrole") for r in g if r.get("arcrole")})
-    linkroles  = sorted({r.get("linkrole") for r in g if r.get("linkrole")})
+        parents   = sorted({p for p, _ in (_endpoints(r) for r in g) if p})
+        children  = sorted({c for _, c in (_endpoints(r) for r in g) if c})
+        arcroles  = sorted({r.get("arcrole") for r in g if r.get("arcrole")})
+        linkroles = sorted({r.get("linkrole") for r in g if r.get("linkrole")})
 
-    # chunk_id 前缀：优先 accno；否则用 relpath（去斜杠）
-    acc = next((r.get("accno") for r in g if r.get("accno")), None)
-    rp  = (relpath_under_input or str(in_file.name)).replace("\\", "/").replace("/", "|")
-    base = acc or rp
+        # chunk_id 前缀
+        acc = next((r.get("accno") for r in g if r.get("accno")), None)
+        rp  = (relpath_under_input or str(in_file.name)).replace("\\", "/").replace("/", "|")
+        base = acc or rp
 
-    # kind（cal/def/fact/generic）
-    if len(file_types) == 1:
-        kind = file_types[0] or "generic"
-    else:
-        stem = in_file.stem.lower()
-        if "calculation" in stem:
-            kind = "cal"
-        elif "definition" in stem or stem.startswith("def"):
-            kind = "def"
-        elif "fact" == stem:
-            kind = "fact"
+        # kind（cal/def/fact/generic）
+        if len(file_types) == 1:
+            kind = file_types[0] or "generic"
         else:
-            kind = "generic"
+            stem = in_file.stem.lower()
+            if "calculation" in stem:
+                kind = "cal"
+            elif "definition" in stem or stem.startswith("def"):
+                kind = "def"
+            elif "fact" == stem:
+                kind = "fact"
+            else:
+                kind = "generic"
 
-    # 将 linkrole 压缩成短标签放进 chunk_id，避免过长
-    lr_tag = (lr or "__NA__").split("/")[-1][:48]  # 取末段并截断
-    chunk_id = f"{base}::{kind}::{lr_tag}::group::{gidx}"
+        # linkrole 短标签
+        lr_tag = (lr or "__NA__").split("/")[-1][:48]
+        chunk_id = f"{base}::{kind}::{lr_tag}::group::{gidx}"
 
-    # 清理冗余字段
-    for r in g:
-        if r.get("preferred_label") is None:
-            r.pop("preferred_label", None)
+        # 清理冗余字段
+        for r in g:
+            if r.get("preferred_label") is None:
+                r.pop("preferred_label", None)
 
-    # 更安全的 summary_text：仅拼有端点的前若干条
-    lines = []
-    for r in g:
-        a, b = _endpoints(r)
-        if not (a and b):
-            continue
-        mid = r.get("arcrole") or r.get("weight")
-        mid = (mid.split("/")[-1] if isinstance(mid, str) else str(mid)) if mid is not None else ""
-        lines.append(f"{a} --{mid}--> {b}")
-        if len(lines) >= 10:   # 避免过长
-            break
-    summary_text = "\n".join(lines)
+        # 简要摘要（前 10 条）
+        lines = []
+        for r in g:
+            a, b = _endpoints(r)
+            if not (a and b):
+                continue
+            mid = r.get("arcrole") or r.get("weight")
+            mid = (mid.split("/")[-1] if isinstance(mid, str) else str(mid)) if mid is not None else ""
+            lines.append(f"{a} --{mid}--> {b}")
+            if len(lines) >= 10:
+                break
+        summary_text = "\n".join(lines)
 
-    out = {
-        "parent_concepts": parents,
-        "arcroles":        arcroles,
-        "child_concepts":  children,
-        "chunk_id":        chunk_id,
-        "chunk_index":     gidx,
-        "chunk_count":     total,
-        "source_file":     str(in_file),
-        "edge_count":      edge_count,
-        "file_type":       (file_types[0] if len(file_types) == 1 else file_types or kind),
-        "tickers":         tickers,
-        "forms":           forms,
-        "years":           years,
-        "accnos":          accnos,
-        "linkroles":       [lr],        # 当前组对应的 linkrole（保持与 chunk_id 一致）
-        "edges":           g,           # 如需沿用 items，这里改回 "items": g
-        "summary_text":    summary_text,
-    }
-    if relpath_under_input is not None:
-        out["relpath"] = relpath_under_input
+        out = {
+            "parent_concepts": parents,
+            "arcroles":        arcroles,
+            "child_concepts":  children,
+            "chunk_id":        chunk_id,
+            "chunk_index":     gidx,
+            "chunk_count":     total,
+            "source_file":     str(in_file),
+            "edge_count":      edge_count,
+            "file_type":       (file_types[0] if len(file_types) == 1 else file_types or kind),
+            "tickers":         tickers,
+            "forms":           forms,
+            "years":           years,
+            "accnos":          accnos,
+            "linkroles":       [lr],
+            "edges":           g,
+            "summary_text":    summary_text,
+        }
+        if relpath_under_input is not None:
+            out["relpath"] = relpath_under_input
 
-
-        if add_summary_text:
-            lines = []
-            for r in g:
-                p, c = _endpoints(r)
-                ar = r.get("arcrole")
-                if p and c:
-                    if ar:
-                        lines.append(f"{p} --{ar.split('/')[-1]}--> {c}")
-                    else:
-                        lines.append(f"{p} --> {c}")
-            out["summary_text"] = "\n".join(lines)
-
+        # ✅ 永远 append（不受任何 if 的影响）
         out_rows.append(out)
 
+    # 循环结束再统一写出
     return write_jsonl(out_file, out_rows)
+
 
 
 
@@ -376,6 +476,8 @@ def run(
             n = process_group_jsonl(
                 f, out_dir / out_name, group_size=group_size,
                 relpath_under_input=relpath,
+                add_summary_text=True,        # ✅ 打开摘要，便于向量化
+                token_budget=350,             # ✅ 防止单块过大（可改 300–500）
             )
             stats["group_files"] += 1
             stats["chunks_written"] += n
@@ -387,6 +489,8 @@ def run(
                 n = process_group_jsonl(
                     f, out_dir / "generic_chunks.jsonl", group_size=group_size,
                     relpath_under_input=relpath,
+                    add_summary_text=True,     # 同上
+                    token_budget=350,          # 同上
                 )
                 stats["unknown_chunked"] += 1
                 stats["chunks_written"] += n
@@ -407,7 +511,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-root", type=Path, default=prj / "data" / "chunked",
                     help="Output root (default: <PROJECT_ROOT>/data/chunked)")
     ap.add_argument("--max-tokens", type=int, default=300, help="Max tokens per text chunk")
-    ap.add_argument("--overlap", type=int, default=60, help="Token overlap between text chunks")
+    ap.add_argument("--overlap", type=int, default=48, help="Token overlap between text chunks")
     ap.add_argument("--group-size", type=int, default=20, help="Records per group chunk")
     ap.add_argument("--no-copy-labels", action="store_true", help="Do not copy labels.jsonl")
     ap.add_argument("--no-unknown", action="store_true", help="Skip unknown *.jsonl instead of chunking generically")
