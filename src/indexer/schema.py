@@ -419,6 +419,8 @@ class LabelItem(BaseModel):
     # 这些是常见追溯字段，允许输入里没有
     ticker: Optional[str] = None
     fy: Optional[int] = None
+    fq: Optional[str] = None
+    doc_date: Optional[str] = None
     form: Optional[str] = None
     accno: Optional[str] = None
     source_path: Optional[str] = None
@@ -429,8 +431,10 @@ class LabelBestItem(BaseModel):
 
     ticker: Optional[str] = None
     fy: Optional[int] = None
+    fq: Optional[str] = None
     form: Optional[str] = None
     accno: Optional[str] = None
+    doc_date: Optional[str] = None
     concept: str
 
     label_best: Optional[str] = None
@@ -472,8 +476,10 @@ class LabelWideItem(BaseModel):
 
     ticker: Optional[str] = None
     fy: Optional[int] = None
+    fq: Optional[str] = None
     form: Optional[str] = None
     accno: Optional[str] = None
+    doc_date: Optional[str] = None
     concept: str
     # 其它所有 label_* 列将被完整保留（extra="allow"）
 

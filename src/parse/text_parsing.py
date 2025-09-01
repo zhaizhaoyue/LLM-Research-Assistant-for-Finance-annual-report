@@ -204,6 +204,25 @@ def detect_page_no(tag) -> int | None:
                 return int(m.group(1))
     return None
 
+def load_dei_from_facts(facts_file: Path) -> dict[str, str]:
+    """从 facts.jsonl 里读 fy/fq/doc_date（取第一条或 meta 行）"""
+    if not facts_file.exists():
+        return {}
+    with facts_file.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            out = {}
+            if row.get("period_fy"):
+                out["fy"] = row["period_fy"]
+            if row.get("period_fq"):
+                out["fq"] = row["period_fq"]
+            if row.get("doc_date"):
+                out["doc_date"] = row["doc_date"]
+            return out
+    return {}
 
 def parse_meta_from_filename(p: Path) -> dict:
     m = FNAME_RE.match(p.name)

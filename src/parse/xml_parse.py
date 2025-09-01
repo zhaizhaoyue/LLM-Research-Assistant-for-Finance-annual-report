@@ -246,6 +246,7 @@ def enrich_meta_from_dei(model_xbrl, meta: Dict[str, Any]) -> Dict[str, Any]:
     fy_s   = get_dei("DocumentFiscalYearFocus")
     fq_s   = get_dei("DocumentFiscalPeriodFocus")
     dped   = get_dei("DocumentPeriodEndDate")  # YYYY-MM-DD
+    fye_s  = get_dei("CurrentFiscalYearEndDate")  # --09-30
 
     if not meta.get("ticker") and ticker:
         meta["ticker"] = ticker.upper()
@@ -265,24 +266,23 @@ def enrich_meta_from_dei(model_xbrl, meta: Dict[str, Any]) -> Dict[str, Any]:
         elif meta.get("doc_date"):
             meta["fy"] = int(meta["doc_date"][:4])
 
-    if not meta.get("fq"):
-        if fq_s:
-            q = fq_s.upper()
-            if q in {"Q1","Q2","Q3","Q4"}:
-                meta["fq"] = q
-            elif q in {"FY","ANNUAL"}:
-                meta["fq"] = None
-        elif meta.get("doc_date"):
-            try:
-                mm = int(meta["doc_date"][4:6])
-                meta["fq"] = {3:"Q1",6:"Q2",9:"Q3",12:"Q4"}.get(mm)
-            except Exception:
-                pass
+    # ✅ 关键：保留 DEI 的 FQ 原值（Q1/Q2/Q3/Q4/FY），不要把 FY 置空
+    if not meta.get("fq") and fq_s:
+        q = fq_s.upper()
+        if q in {"Q1","Q2","Q3","Q4","FY"}:
+            meta["fq"] = q
+
+    # 可选：保留公司 FYE（兜底推断时有用）
+    if fye_s:
+        m = re.search(r"(\d{2})-(\d{2})", fye_s)
+        if m:
+            meta["fye"] = f"{m.group(1)}-{m.group(2)}"
 
     if not meta.get("year") and meta.get("fy"):
         meta["year"] = str(meta["fy"])
 
     return meta
+
 
 # ---------------- arelle helpers ----------------
 from arelle import Cntlr, FileSource
@@ -569,12 +569,17 @@ def parse_one(file_path: Path) -> pd.DataFrame:
         stmt_hint = guess_statement_hint(qname)
         period_fy = derive_period_fy(ps, pe, inst, base_meta.get("fy"))
         period_fq = derive_period_fq(ps, pe, inst)
+        # 若从 context 推不出季度，用 DEI 的 fq 兜底
+        if not period_fq and base_meta.get("fq"):
+            period_fq = base_meta.get("fq")
         # 用“期间财年”生成更准确的 label（而不是 meta year）
         per_label = period_label_builder(period_fy, ps, pe, inst)
         row = dict(
             # —— 你要求保留的核心字段 ——
             period_fy=period_fy,               # 由 instant / end_date 推得的“期间财年”（calendar 年）
             period_fq=period_fq,
+            fy=(base_meta.get("fy") or None),            # ✅ 新增：行级 FY
+            fq=(base_meta.get("fq") or period_fq or None), 
             qname=qname,
             value=value,
             unitRef=unit_ref,

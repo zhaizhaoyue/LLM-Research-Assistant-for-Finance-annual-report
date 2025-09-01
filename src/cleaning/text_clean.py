@@ -398,10 +398,23 @@ def process_jsonl_line(
 
                 "heading": heading_state.get("current_heading"),
             }
+
+            # —— 透传/兜底关键元数据：优先用输入行，其次用 file_meta
+            passthrough_keys = ("ticker", "year", "form", "accno", "fy", "fq", "doc_date", "source_path")
+
+            # 1) 行内优先
+            for k in passthrough_keys:
+                if k in line and line.get(k) is not None:
+                    row[k] = line.get(k)
+
+            # 2) file_meta 只补空缺
             if file_meta:
-                row.update(file_meta)
+                for k in passthrough_keys:
+                    if row.get(k) is None and file_meta.get(k) is not None:
+                        row[k] = file_meta.get(k)
 
             out_rows.append(row)
+
 
     return out_rows
 
@@ -428,7 +441,7 @@ def infer_meta_from_path(input_path: Path, base_dir: Optional[Path]) -> Dict[str
             "ticker": ticker,
             "year": year,
             "form": form,
-            "accession": accno,
+            "accno": accno, 
             "source_path": str(input_path)
         }
     except Exception:
