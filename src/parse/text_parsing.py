@@ -235,7 +235,9 @@ def parse_meta_from_filename(p: Path) -> dict:
         docdate = None
     else:
         g = m.groupdict()
-        ticker, year, form, accno, docdate, ext = g["ticker"], g["year"], g["form"], g["accno"], g["docdate"], g["ext"]
+        ticker, year, form, accno, docdate, ext = (
+            g["ticker"], g["year"], g["form"], g["accno"], g["docdate"], g["ext"]
+        )
 
     return {
         "ticker": ticker.upper(),
@@ -244,8 +246,9 @@ def parse_meta_from_filename(p: Path) -> dict:
         "accno": normalize_accno(accno),
         "doc_date": docdate,
         "ext": ext.lower(),
-        "source_path": str(p),
+        "source_path": p.as_posix(),   # ✅ 统一为 POSIX 风格路径
     }
+
 
 def chunk_by_tokens(text: str, max_tokens: int, overlap_tokens: int) -> list[tuple[int, int, str]]:
     """返回 [(start_tok, end_tok, chunk_text), ...]。不依赖外网库，tiktoken 可选。"""

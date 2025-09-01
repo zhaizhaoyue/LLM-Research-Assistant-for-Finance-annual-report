@@ -183,7 +183,7 @@ def sniff_meta(p: Path) -> Dict[str, Any]:
     meta = {
         "ticker": None, "year": None, "form": None,
         "accno": None, "doc_date": None, "fy": None, "fq": None,
-        "source_path": str(p),
+        "source_path": p.as_posix()
     }
 
     m_acc = ACCNO_SEARCH_RE.search(name) or ACCNO_SEARCH_RE.search(str(p))
@@ -685,7 +685,7 @@ def parse_one(file_path: Path) -> pd.DataFrame:
             year=(str(base_meta.get("year")) if base_meta.get("year") else None),
             accno=(base_meta.get("accno") or None),
             doc_date=(base_meta.get("doc_date") or None),
-            source_path=str(file_path),
+            source_path=file_path.as_posix()
         )
 
         # === 维度签名（只做一次） ===
