@@ -1,0 +1,3 @@
+{"id":"q001","type":"numeric","query":"2023年AAPL营收同比是多少？","filters":{"ticker":"AAPL","form":"10-K","year":2023},"expect":{"change_type":"YoY","target":"revenue","value_pct": "2.1%", "tol_abs": 0.003}}
+{"id":"q012","type":"textual","query":"AAPL 2023年主要营收驱动因素是什么？","filters":{"ticker":"AAPL","form":"10-K","year":2023},"expect":{"keywords":["iPhone","服务","可穿戴"]}}
+{"id":"q021","type":"mixed","query":"AAPL 2023年现金与等价物余额及其变动原因？","filters":{"ticker":"AAPL","form":"10-K","year":2023},"expect":{"must_include":["cash","operating cash flow"],"deny":[]}}

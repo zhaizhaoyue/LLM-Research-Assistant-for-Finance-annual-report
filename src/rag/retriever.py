@@ -172,3 +172,14 @@ class HybridRetriever(FaissRetriever):
         fused.sort(key=lambda x: x["score"], reverse=True)
         return fused[:top_k]
 
+ingleton
+
+def hybrid_search(query: str, filters: Dict[str, Any], topk: int = 8) -> List[Dict[str, Any]]:
+    r = get_retriever()
+    return r.search_hybrid(
+        query=query,
+        top_k=topk,
+        ticker=filters.get("ticker"),
+        year=filters.get("year"),
+        form=str(filters.get("form") or "").upper() if filters.get("form") else None,
+    )

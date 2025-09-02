@@ -1,1 +1,0 @@
-#输出会保存到 data/index/faiss/。
