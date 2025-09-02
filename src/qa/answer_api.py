@@ -136,15 +136,25 @@ _REQUIRED_FACT_COLS = [
 
 
 YOY_PATTERNS = [
+    # 方向在前：decreased 3% ... during 2023 compared to 2022
     re.compile(
-        r"(?:in|during)\s*2023[^\.]{0,160}?\b(increased|decreased)\b\s*(?P<pct>\d+(?:\.\d+)?)\s*%[^\.]{0,120}?(?:compared\s+to|vs\.?)\s*2022",
+        r"(?P<dir>increased|decreased)\s*(?:by\s*)?(?P<pct>\d+(?:\.\d+)?)\s*%[^\.]{0,240}?(?:in|during)?\s*(?P<y2>20\d{2})?[^\.]{0,160}?(?:compared\s+to|vs\.?)\s*(?P<y1>20\d{2})?",
         re.IGNORECASE,
     ),
+    # 年份在前，然后方向和百分比：in/during 2023 ... increased/decreased 3% ... compared to 2022
     re.compile(
-        r"2023[^\.]{0,160}?(?:compared\s+to|vs\.?)\s*2022[^\.]{0,160}?\b(increased|decreased)\b\s*(?P<pct>\d+(?:\.\d+)?)\s*%",
+        r"(?:in|during)\s*(?P<y2>20\d{2})[^\.]{0,240}?(?P<dir>increased|decreased)\s*(?:by\s*)?(?P<pct>\d+(?:\.\d+)?)\s*%[^\.]{0,160}?(?:compared\s+to|vs\.?)\s*(?P<y1>20\d{2})",
+        re.IGNORECASE,
+    ),
+    # 两个年份先出现，然后方向与百分比在后：2023 ... compared to 2022 ... decreased 3%
+    re.compile(
+        r"(?P<y2>20\d{2})[^\.]{0,240}?(?:compared\s+to|vs\.?)\s*(?P<y1>20\d{2})[^\.]{0,240}?(?P<dir>increased|decreased)\s*(?:by\s*)?(?P<pct>\d+(?:\.\d+)?)\s*%",
         re.IGNORECASE,
     ),
 ]
+
+
+
 
 MONEY_PAT = re.compile(
     r"\$?\s*(?P<val>[\d\.,]+)\s*(?P<unit>billion|million|thousand|bn|mm|k)?",
@@ -175,41 +185,80 @@ def _call_answer_textual_or_mixed(q, hits, filters, use_llm):
 
 
 def extract_yoy_from_snippet(snippet: str) -> Optional[dict]:
-    if not snippet: return None
+    if not snippet:
+        return None
     text = " ".join(snippet.split())
     for pat in YOY_PATTERNS:
         m = pat.search(text)
         if m:
-            direction = m.group(1).lower()
+            direction = m.group("dir").lower()
             pct = float(m.group("pct"))
             if direction == "decreased":
                 pct = -pct
-            # 试抓 “or $11.0 billion”
-            tail = text[m.end(): m.end() + 120]
-            m2 = re.search(r"\bor\b[^$]{0,12}\$?\s*([\d\.,]+)\s*(billion|million|thousand|bn|mm|k)?", tail, re.IGNORECASE)
+            # 顺手抓 “or $11.0 billion ...” 当作绝对变动
+            tail = text[m.end(): m.end() + 200]
+            m2 = re.search(
+                r"\bor\b[^$]{0,24}\$?\s*([\d\.,]+)\s*(billion|million|thousand|bn|mm|k)?",
+                tail,
+                re.IGNORECASE,
+            )
             delta_abs = _money_to_number(m2.group(1), m2.group(2)) if m2 else None
-            return {"pct": pct, "delta_abs": delta_abs}
+            return {"pct": pct, "yoy_abs": delta_abs}
     return None
+
 
 def try_text_fallback_for_yoy(top_hits: list[dict]) -> Optional[Tuple[dict, dict]]:
     """
-    在 top_hits 里找含 'net sales'/'revenue' 的片段并解析 YoY。
-    返回: (result, cite_meta)
-      result: {"yoy_pct": float, "yoy_abs": Optional[float]}
-      cite_meta: 命中的 hit["meta"]（若无则整个 hit）
+    先在每条 snippet 内匹配；不行的话合并所有 snippet+text 做一遍全局匹配。
+    命中后返回 ({"yoy_pct": float, "yoy_abs": float|None}, cite_meta)。
     """
-    kws = ("net sales", "revenue", "sales")
-    for h in top_hits:
+    def _extract(text: str) -> Optional[dict]:
+        if not text:
+            return None
+        t = " ".join(text.split())
+        for pat in YOY_PATTERNS:
+            m = pat.search(t)
+            if m:
+                direction = m.group("dir").lower()
+                pct = float(m.group("pct"))
+                if direction == "decreased":
+                    pct = -pct
+                tail = t[m.end(): m.end() + 240]
+                m2 = re.search(
+                    r"\bor\b[^$]{0,32}\$?\s*([\d\.,]+)\s*(billion|million|thousand|bn|mm|k)?",
+                    tail,
+                    re.IGNORECASE,
+                )
+                delta_abs = _money_to_number(m2.group(1), m2.group(2)) if m2 else None
+                return {"yoy_pct": pct, "yoy_abs": delta_abs}
+        return None
+
+    # 1) 逐条 snippet 尝试（优先用本条作引用）
+    for h in top_hits or []:
         snippet = h.get("snippet") or h.get("text") or ""
-        meta = h.get("meta") or h
-        if not snippet: 
+        if not snippet:
             continue
-        if not any(k in snippet.lower() for k in kws):
-            continue
-        parsed = extract_yoy_from_snippet(snippet)
-        if parsed:
-            return ({"yoy_pct": parsed["pct"], "yoy_abs": parsed.get("delta_abs")}, meta)
+        if _extract(snippet):
+            return _extract(snippet), (h.get("meta") or h)
+
+    # 2) 合并全文再试（找一个包含命中片段关键词的 hit 作为引用）
+    all_texts = []
+    for h in top_hits or []:
+        all_texts.append(h.get("snippet") or h.get("text") or "")
+    merged = "  ".join(all_texts)
+    res = _extract(merged)
+    if res:
+        # 简单选择：优先含 "net sales"/"revenue"/"sales" 的那条作为引用；否则第一条
+        kw = ("net sales", "revenue", "sales")
+        for h in top_hits or []:
+            s = (h.get("snippet") or h.get("text") or "").lower()
+            if any(k in s for k in kw):
+                return res, (h.get("meta") or h)
+        if top_hits:
+            return res, (top_hits[0].get("meta") or top_hits[0])
+
     return None
+
 
 def format_citations(metas: list[dict]) -> list[dict]:
     out, seen = [], set()
@@ -1095,21 +1144,21 @@ def answer_question(query: str, filters: Dict[str, Any]) -> Dict[str, Any]:
         hits = hybrid_search(query=q, filters=filters or {}, topk=8)
         hits = _dedupe_and_cap_hits(hits, topk=8)
 
-        if DEBUG:
-            print("\n[DEBUG] top hits (trimmed):")
-            for h in hits[:5]:
-                m = (h.get("meta") or {})
-                snippet = (h.get("snippet") or h.get("text") or "")
-                snippet = re.sub(r"\s+", " ", snippet).strip()[:120]
-                print({
-                    "chunk_id": h.get("chunk_id"),
-                    "file_type": (m.get("file_type") or "text"),
-                    "fy": (m.get("fy") or m.get("fy_norm")),
-                    "fq": (m.get("fq") or m.get("fq_norm")),
-                    "period_end": m.get("period_end"),
-                    "concept": m.get("concept"),
-                    "snippet": snippet
-                })
+        # if DEBUG:
+        #     print("\n[DEBUG] top hits (trimmed):")
+        #     for h in hits[:5]:
+        #         m = (h.get("meta") or {})
+        #         snippet = (h.get("snippet") or h.get("text") or "")
+        #         snippet = re.sub(r"\s+", " ", snippet).strip()[:120]
+        #         print({
+        #             "chunk_id": h.get("chunk_id"),
+        #             "file_type": (m.get("file_type") or "text"),
+        #             "fy": (m.get("fy") or m.get("fy_norm")),
+        #             "fq": (m.get("fq") or m.get("fq_norm")),
+        #             "period_end": m.get("period_end"),
+        #             "concept": m.get("concept"),
+        #             "snippet": snippet
+        #         })
 
     except Exception as e:
         logger.exception("检索阶段异常")
@@ -1143,6 +1192,31 @@ def answer_question(query: str, filters: Dict[str, Any]) -> Dict[str, Any]:
                     "llm_model": None,
                     "ctx_tokens": None,
                 }
+            
+
+            fb = try_text_fallback_for_yoy(hits)
+            if fb:
+                result, cite_meta = fb
+                yoy_pct = result.get("yoy_pct")
+                yoy_abs = result.get("yoy_abs")
+                ans = f"YoY：{yoy_pct:.2f}%"
+                if yoy_abs is not None:
+                    ans += f"；绝对变动≈{_format_money(yoy_abs)}"
+                ans += "。"
+                citations = format_citations([cite_meta])
+                citations_display = [citation_to_display(c) for c in citations]
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                return {
+                    "final_answer": ans,
+                    "reasoning": "facts_numeric 未命中，改用 10-K/10-Q 文本片段的 YoY 正则抽取。",
+                    "citations": citations,
+                    "citations_display": citations_display,
+                    "used_method": used_method + "::numeric_fallback_yoy_regex",
+                    "latency_ms": latency_ms,
+                    "prompt_version": PROMPT_VERSION,
+                    "llm_model": None,
+                    "ctx_tokens": None,
+                }         
             # numeric 失败：根据开关决定是否允许文本兜底
             if DISABLE_TEXT_FALLBACK:
                 latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -1189,8 +1263,83 @@ def answer_question(query: str, filters: Dict[str, Any]) -> Dict[str, Any]:
                 "ctx_tokens": None,
                 }
         else:
+            # 先试 YoY 正则
+            fb = try_text_fallback_for_yoy(hits)
+            if fb:
+                result, cite_meta = fb
+                yoy_pct = result.get("yoy_pct")
+                yoy_abs = result.get("yoy_abs")
+                ans = f"YoY：{yoy_pct:.2f}%"
+                if yoy_abs is not None:
+                    ans += f"；绝对变动≈{_format_money(yoy_abs)}"
+                ans += "。"
+                citations = format_citations([cite_meta])
+                citations_display = [citation_to_display(c) for c in citations]
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                return {
+                    "final_answer": ans,
+                    "reasoning": "问题被判为文本，但从 10-K/10-Q 片段抽到了规范 YoY 表述，直接产出结构化答案。",
+                    "citations": citations,
+                    "citations_display": citations_display,
+                    "used_method": used_method + "::textual_promoted_yoy_regex",
+                    "latency_ms": latency_ms,
+                    "prompt_version": PROMPT_VERSION,
+                    "llm_model": None,
+                    "ctx_tokens": None,
+                }
+
+            # 抓不到再走文本/混合问答
             final_answer, reasoning, citations = _call_answer_textual_or_mixed(q, hits, filters, use_llm=USE_LLM)
             used = used_method + f"::{qtype}"
+
+            # --- 垃圾长段拦截 ---
+            def _looks_like_snippet_dump(s: str) -> bool:
+                if not s or len(s) < 140:
+                    return False
+                # 无任何数字百分比/金额/单位，却非常长，疑似原文拼贴
+                has_num = bool(re.search(r"-?\d[\d,\.]*\s*%|\$\s*\d", s))
+                too_long = len(s) > 240
+                many_stops = s.count(".") + s.count("。") >= 3
+                return (not has_num) and (too_long or many_stops)
+
+            if final_answer and _looks_like_snippet_dump(final_answer):
+                fb2 = try_text_fallback_for_yoy(hits)  # 再试一次全局 YoY
+                if fb2:
+                    result, cite_meta = fb2
+                    yoy_pct = result.get("yoy_pct")
+                    yoy_abs = result.get("yoy_abs")
+                    ans = f"YoY：{yoy_pct:.2f}%"
+                    if yoy_abs is not None:
+                        ans += f"；绝对变动≈{_format_money(yoy_abs)}"
+                    ans += "。"
+                    citations = format_citations([cite_meta])
+                    citations_display = [citation_to_display(c) for c in citations]
+                    latency_ms = int((time.perf_counter() - t0) * 1000)
+                    return {
+                        "final_answer": ans,
+                        "reasoning": "文本模型输出疑似原文拼贴，改用全文 YoY 正则兜底。",
+                        "citations": citations,
+                        "citations_display": citations_display,
+                        "used_method": used_method + "::textual_sanitized_to_yoy_regex",
+                        "latency_ms": latency_ms,
+                        "prompt_version": PROMPT_VERSION,
+                        "llm_model": None,
+                        "ctx_tokens": None,
+                    }
+                # 还不行就直接给“信息不足”，避免脏答案
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                return {
+                    "final_answer": "信息不足",
+                    "reasoning": "文本检索命中但未形成结构化数值结论，且模型输出疑似原文拼贴，已拦截。",
+                    "citations": [],
+                    "citations_display": [],
+                    "used_method": used_method + "::textual_blocked_snippet_dump",
+                    "latency_ms": latency_ms,
+                    "prompt_version": PROMPT_VERSION,
+                    "llm_model": None,
+                    "ctx_tokens": None,
+                }
+
     except Exception as e:
         logger.exception("作答阶段异常")
         return _error_result(f"作答失败：{e}", used_method + f"::{qtype}", t0)
@@ -1270,6 +1419,6 @@ if __name__ == "__main__":
 
 
 '''
-python -m src.qa.answer_api --q "What is the year-over-year revenue in 2023?" --ticker AAPL --form 10-K --year 2023
+python -m src.qa.answer_api --q "What is the year-over-year revenue in 2023 in Apple??" 
 
 '''
