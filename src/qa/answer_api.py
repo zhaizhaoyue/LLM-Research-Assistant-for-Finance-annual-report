@@ -16,8 +16,8 @@ USE_LLM = os.getenv("RAG_USE_LLM", "true").lower() in {"1", "true", "yes", "y"}
 PROMPT_VERSION = os.getenv("RAG_PROMPT_VER", "2025-09-02-v2")
 LLM_MODEL_NAME = os.getenv("RAG_LLM_MODEL", "your-llm-name")  # 仅用于记录
 FACTS_NUMERIC_PATH = os.getenv("RAG_FACTS_NUMERIC", "data/clean/facts_numeric.parquet")
-# 禁止 numeric 失败后走文本兜底；想临时恢复，把环境变量设为 1
-DISABLE_TEXT_FALLBACK = os.getenv("RAG_DISABLE_TEXT_FALLBACK", "1") in {"1","true","yes","y"}
+DISABLE_TEXT_FALLBACK = os.getenv("RAG_DISABLE_TEXT_FALLBACK", "0") in {"1","true","yes","y"}
+
 _REVENUE_ALIASES = [
     "us-gaap:SalesRevenueNet",
     "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -133,6 +133,101 @@ _REQUIRED_FACT_COLS = [
     "period_start","period_end","instant",
     "page_no","source_path"
 ]
+
+
+YOY_PATTERNS = [
+    re.compile(
+        r"(?:in|during)\s*2023[^\.]{0,160}?\b(increased|decreased)\b\s*(?P<pct>\d+(?:\.\d+)?)\s*%[^\.]{0,120}?(?:compared\s+to|vs\.?)\s*2022",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"2023[^\.]{0,160}?(?:compared\s+to|vs\.?)\s*2022[^\.]{0,160}?\b(increased|decreased)\b\s*(?P<pct>\d+(?:\.\d+)?)\s*%",
+        re.IGNORECASE,
+    ),
+]
+
+MONEY_PAT = re.compile(
+    r"\$?\s*(?P<val>[\d\.,]+)\s*(?P<unit>billion|million|thousand|bn|mm|k)?",
+    re.IGNORECASE,
+)
+
+def _money_to_number(val: str, unit: Optional[str]) -> float:
+    v = float(val.replace(",", ""))
+    if not unit: return v
+    u = unit.lower()
+    if u in ("billion", "bn"):   return v * 1e9
+    if u in ("million", "mm"):   return v * 1e6
+    if u in ("thousand", "k"):   return v * 1e3
+    return v
+
+def _call_answer_textual_or_mixed(q, hits, filters, use_llm):
+    res = answer_textual_or_mixed(q, hits, filters, use_llm=use_llm)
+    # 兼容两种返回形式
+    if isinstance(res, tuple) and len(res) >= 3:
+        final_answer, reasoning, citations = res[0], res[1], res[2]
+    elif isinstance(res, dict):
+        final_answer = res.get("final_answer")
+        reasoning = res.get("reasoning")
+        citations = res.get("citations", [])
+    else:
+        final_answer, reasoning, citations = None, None, []
+    return final_answer, reasoning, citations
+
+
+def extract_yoy_from_snippet(snippet: str) -> Optional[dict]:
+    if not snippet: return None
+    text = " ".join(snippet.split())
+    for pat in YOY_PATTERNS:
+        m = pat.search(text)
+        if m:
+            direction = m.group(1).lower()
+            pct = float(m.group("pct"))
+            if direction == "decreased":
+                pct = -pct
+            # 试抓 “or $11.0 billion”
+            tail = text[m.end(): m.end() + 120]
+            m2 = re.search(r"\bor\b[^$]{0,12}\$?\s*([\d\.,]+)\s*(billion|million|thousand|bn|mm|k)?", tail, re.IGNORECASE)
+            delta_abs = _money_to_number(m2.group(1), m2.group(2)) if m2 else None
+            return {"pct": pct, "delta_abs": delta_abs}
+    return None
+
+def try_text_fallback_for_yoy(top_hits: list[dict]) -> Optional[Tuple[dict, dict]]:
+    """
+    在 top_hits 里找含 'net sales'/'revenue' 的片段并解析 YoY。
+    返回: (result, cite_meta)
+      result: {"yoy_pct": float, "yoy_abs": Optional[float]}
+      cite_meta: 命中的 hit["meta"]（若无则整个 hit）
+    """
+    kws = ("net sales", "revenue", "sales")
+    for h in top_hits:
+        snippet = h.get("snippet") or h.get("text") or ""
+        meta = h.get("meta") or h
+        if not snippet: 
+            continue
+        if not any(k in snippet.lower() for k in kws):
+            continue
+        parsed = extract_yoy_from_snippet(snippet)
+        if parsed:
+            return ({"yoy_pct": parsed["pct"], "yoy_abs": parsed.get("delta_abs")}, meta)
+    return None
+
+def format_citations(metas: list[dict]) -> list[dict]:
+    out, seen = [], set()
+    for m in metas:
+        meta = m.get("meta") or m
+        c = {
+            "source_path": meta.get("source_path") or meta.get("path") or meta.get("file"),
+            "accno": meta.get("accno"),
+            "page_no": meta.get("page_no"),
+            "chunk_id": meta.get("chunk_id"),
+            "file_type": meta.get("file_type"),
+        }
+        k = (c.get("accno"), c.get("page_no"), c.get("chunk_id"))
+        if k in seen: 
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
 
 def _facts_df():
     """延迟加载 facts_numeric.parquet；若缺列则补 None，类型尽量规范化，确保 numeric 计算不炸。"""
@@ -416,14 +511,6 @@ def _compute_eps(df, ticker, form, diluted: bool, fy=None, fq=None, yoy=False):
         if not row: return None, [], "数据不足"
         return float(row["value_std"]), [row], None
 
-# 可能遇到“revenue”概念多种命名，给一些别名候选
-_REVENUE_ALIASES = [
-    "us-gaap:SalesRevenueNet",
-    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
-    "us-gaap:SalesRevenueGoodsNet",
-    "us-gaap:SalesRevenueServicesNet",
-    "us-gaap:Revenues",
-]
 
 def _latest_fy_fq(df, ticker: Optional[str], form: Optional[str]):
     """在 facts_numeric 里找该 ticker/form 的最新财年与季度（兜底）"""
@@ -654,22 +741,28 @@ def _numeric_answer_pipeline(
             v, rows, err = _compute_qoq_rows(df, ticker, form, concept, fy, fq)
             if v is None: 
                  # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
+                # --- QoQ 自救：以 cur 的季度去找上一季 ---
                 rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
                 if rows_now:
-                    fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
-                    prv = _get_fact(df, ticker, form, concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
+                    fy_now = int(cur.get("fy_norm") or cur.get("fy"))
+                    fq_now = _norm_fq_str(cur.get("fq_norm") or cur.get("fq")) or "Q4"
+                    order = ["Q1","Q2","Q3","Q4"]
+                    i = order.index(fq_now)
+                    fy_prev, fq_prev = (fy_now-1, "Q4") if i == 0 else (fy_now, order[i-1])
+
+                    prv = _get_fact(df, ticker, form, concept, fy_prev, fq_prev)
                     if prv and cur and float(prv.get("value_std") or 0) != 0:
                         v = (float(cur["value_std"]) - float(prv["value_std"])) / float(prv["value_std"])
                         rows = [prv, cur]; err = None
-                        # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"QoQ：{_format_pct(v)}（{fy_prev} {fq_prev} → {fy_now} {fq_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
+
             cits, disp = _rows_to_citations(rows, hits)
             ans = f"QoQ：{_format_pct(v)}。"
             rsn = f"概念={concept}；ticker={ticker or 'NA'}；form={form or 'NA'}；fy={fy}, fq={fq}。"
@@ -814,7 +907,7 @@ def _numeric_answer_pipeline(
             v, rows, err = _compute_ratio(df, ticker, form, num, den, fy=fy, fq=fq, ttm=ttm)
             if v is None: 
                  # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
-                rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
+                rows_now, note = _relax_numeric_attempts(df, ticker, form, num, fy, args.get("fq"), hits)
                 if rows_now:
                     fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
@@ -840,7 +933,7 @@ def _numeric_answer_pipeline(
             v, rows, err = _compute_ratio(df, ticker, form, num, den, fy=fy, fq=fq, ttm=ttm)
             if v is None: 
                  # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
-                rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
+                rows_now, note = _relax_numeric_attempts(df, ticker, form, num, fy, args.get("fq"), hits)
                 if rows_now:
                     fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
@@ -866,11 +959,11 @@ def _numeric_answer_pipeline(
             v, rows, err = _compute_fcf(df, ticker, form, fy=fy, fq=fq, ttm=False)
             if v is None: 
                  # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
-                rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
+                rows_now, note = _relax_numeric_attempts(df, ticker, form, GAAP["cfo"], fy, args.get("fq"), hits)
                 if rows_now:
                     fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
-                    prv = _get_fact(df, ticker, form, concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
+                    prv = _get_fact(df, ticker, form, GAAP["cfo"], fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
                     if prv and cur and float(prv.get("value_std") or 0) != 0:
                         v = (float(cur["value_std"]) - float(prv["value_std"])) / float(prv["value_std"])
                         rows = [prv, cur]; err = None
@@ -892,11 +985,11 @@ def _numeric_answer_pipeline(
             v, rows, err = _compute_fcf(df, ticker, form, fy=fy, fq=fq, ttm=True)
             if v is None: 
                  # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
-                rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
+                rows_now, note = _relax_numeric_attempts(df, ticker, form, GAAP["cfo"], fy, args.get("fq"), hits)
                 if rows_now:
                     fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
-                    prv = _get_fact(df, ticker, form, concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
+                    prv = _get_fact(df, ticker, form, GAAP["cfo"], fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
                     if prv and cur and float(prv.get("value_std") or 0) != 0:
                         v = (float(cur["value_std"]) - float(prv["value_std"])) / float(prv["value_std"])
                         rows = [prv, cur]; err = None
@@ -917,12 +1010,12 @@ def _numeric_answer_pipeline(
             diluted, fy, fq = bool(args["diluted"]), args.get("fy"), args.get("fq")
             v, rows, err = _compute_eps(df, ticker, form, diluted=diluted, fy=fy, fq=fq, yoy=False)
             if v is None: 
-                 # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
-                rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
+                eps_concept = GAAP["eps_diluted"] if diluted else GAAP["eps_basic"]
+                rows_now, note = _relax_numeric_attempts(df, ticker, form, eps_concept, fy, args.get("fq"), hits)
                 if rows_now:
                     fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
-                    prv = _get_fact(df, ticker, form, concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
+                    prv = _get_fact(df, ticker, form, eps_concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
                     if prv and cur and float(prv.get("value_std") or 0) != 0:
                         v = (float(cur["value_std"]) - float(prv["value_std"])) / float(prv["value_std"])
                         rows = [prv, cur]; err = None
@@ -944,12 +1037,13 @@ def _numeric_answer_pipeline(
             diluted, fy, fq = bool(args["diluted"]), int(args["fy"]), args.get("fq")
             v, rows, err = _compute_eps(df, ticker, form, diluted=diluted, fy=fy, fq=fq, yoy=True)
             if v is None: 
-                 # 走自救链：先拿到“当前期”的行，再自己拼上一年前的行去算同比
-                rows_now, note = _relax_numeric_attempts(df, ticker, form, concept, fy, args.get("fq"), hits)
+                eps_concept = GAAP["eps_diluted"] if diluted else GAAP["eps_basic"]
+                rows_now, note = _relax_numeric_attempts(df, ticker, form, eps_concept, fy, args.get("fq"), hits)
+
                 if rows_now:
                     fy_now = int(rows_now[-1].get("fy_norm") or rows_now[-1].get("fy"))
                     cur = rows_now[-1]
-                    prv = _get_fact(df, ticker, form, concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
+                    prv = _get_fact(df, ticker, form, eps_concept, fy_now-1, _norm_fq_str(cur.get("fq_norm") or cur.get("fq")))
                     if prv and cur and float(prv.get("value_std") or 0) != 0:
                         v = (float(cur["value_std"]) - float(prv["value_std"])) / float(prv["value_std"])
                         rows = [prv, cur]; err = None
@@ -1064,11 +1158,38 @@ def answer_question(query: str, filters: Dict[str, Any]) -> Dict[str, Any]:
                     "ctx_tokens": None,
                 }
             # 允许文本兜底（仅当你手动打开环境变量）
-            final_answer, reasoning, citations = answer_textual_or_mixed(q, hits, filters, use_llm=USE_LLM)
-            used = used_method + "::numeric_fallback_text"
+            final_answer, reasoning, citations = _call_answer_textual_or_mixed(q, hits, filters, use_llm=USE_LLM)
 
+            used = used_method + "::numeric_fallback_text"
+            if final_answer:
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                return {
+                    "final_answer": final_answer,
+                    "reasoning": reasoning,
+                    "citations": citations,
+                    "citations_display": citations,
+                    "used_method": used,
+                    "latency_ms": latency_ms,
+                    "prompt_version": PROMPT_VERSION,
+                    "llm_model": None,
+                    "ctx_tokens": None,
+                }
+
+            # 文本兜底也没有命中 → 保持原有“信息不足”
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            return {
+                "final_answer": "信息不足",
+                "reasoning": f"数值意图识别但无法安全计算：{rsn}",
+                "citations": [],
+                "citations_display": [],
+                "used_method": used_method + "::numeric_failed_text_fallback_miss",
+                "latency_ms": latency_ms,
+                "prompt_version": PROMPT_VERSION,
+                "llm_model": None,
+                "ctx_tokens": None,
+                }
         else:
-            final_answer, reasoning, citations = answer_textual_or_mixed(q, hits, filters, use_llm=USE_LLM)
+            final_answer, reasoning, citations = _call_answer_textual_or_mixed(q, hits, filters, use_llm=USE_LLM)
             used = used_method + f"::{qtype}"
     except Exception as e:
         logger.exception("作答阶段异常")
