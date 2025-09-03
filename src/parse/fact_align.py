@@ -1,3 +1,4 @@
+#7
 from __future__ import annotations
 import argparse, json, re, gzip, sys
 from pathlib import Path
@@ -442,11 +443,15 @@ def main():
 if __name__ == "__main__":
     main()
 
+'''
 
-# python -m src.parse.fact_align `
-#   --compact_root data/compact_tables `
-#   --facts data/normalized `
-#   --min_score 65 `
-#   --limit_concepts 500 `
-#   --debug_match `
-#   --topk 5
+python -m src.parse.fact_align `
+  --compact_root data/compact_tables `
+  --facts data/normalized `
+  --min_score 65 `
+  --limit_concepts 500 `
+  --debug_match `
+  --topk 5
+
+'''
+

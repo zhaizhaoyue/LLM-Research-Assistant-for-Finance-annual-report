@@ -1,53 +1,96 @@
-
+# tests/test_hybrid_qa.py
+import pytest
 import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
-from src.qa.hybrid_qa import answer_textual_or_mixed
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from src.qa.hybrid_qa import (
+    answer_textual_or_mixed,
+    _clean_snippet,
+    _rule_based_answer,
+    _build_llm_prompt,
+)
 
-def _hit(snippet, source_path="data/raw/US_AAPL_2023_10-K_x.html", page_no=12, chunk_id="cid1"):
-    return {
-        "snippet": snippet,
-        "chunk_id": chunk_id,
-        "meta": {
-            "source_path": source_path,
-            "page_no": page_no,
-            "file_type": "text_chunk",
-            "ticker": "AAPL",
-            "fy": 2023,
-        }
-    }
 
-def test_basic_rule_answer_no_llm():
-    hits = [
-        _hit("Total net sales decreased 3% or $11.0 billion during 2023 compared to 2022."),
-        _hit("The weakness in foreign currencies accounted for more than the entire decrease.", page_no=13, chunk_id="cid2"),
+@pytest.fixture
+def sample_hits():
+    return [
+        {
+            "chunk_id": "cid_1",
+            "snippet": "The company's revenue increased by 10% year over year in 2023.",
+            "meta": {
+                "source_path": "data/raw_reports/standard/US_AAPL_2023_10-K.html",
+                "accno": "0000320193-23-000106",
+                "ticker": "AAPL",
+                "form": "10-K",
+                "fy": 2023,
+                "fq": "FY",
+                "page_no": 26,
+                "section": "Item 7",
+            },
+        },
+        {
+            "chunk_id": "cid_2",
+            "snippet": "In 2022, the revenue was slightly higher compared to 2023.",
+            "meta": {
+                "source_path": "data/raw_reports/standard/US_AAPL_2022_10-K.html",
+                "accno": "0000320193-22-000108",
+                "ticker": "AAPL",
+                "form": "10-K",
+                "fy": 2022,
+                "fq": "FY",
+                "page_no": 24,
+                "section": "Item 7",
+            },
+        },
     ]
-    final, reasoning, cits = answer_textual_or_mixed(
-        query="2023年净销售额同比变化？", hits=hits, filters={}, use_llm=False, k_ctx=4, max_chars=300
-    )
-    print("FINAL:", final)
-    print("REASON:", reasoning)
-    print("CITS :", cits)
-    assert "decreased 3%" in final.lower()
-    assert len(cits) >= 1
 
-def test_empty_hits_graceful():
-    final, reasoning, cits = answer_textual_or_mixed(
-        query="What happened to net sales?", hits=[], filters={}, use_llm=False
-    )
-    print("FINAL(empty):", final)
-    assert "无法给出充分的信息" in final  # 兜底提示
-    assert cits == []
 
-def test_messy_snippet_cleanup():
-    messy = "  ●●  TOTAL  NET  SALES   \n  decreased   3%     \n\n during 2023  "
-    final, _, _ = answer_textual_or_mixed(
-        query="?", hits=[_hit(messy)], filters={}, use_llm=False
-    )
-    print("FINAL(clean):", final)
-    assert "TOTAL NET SALES" in final or "total net sales" in final.lower()
+def test_rule_based_answer(sample_hits):
+    blocks = [sample_hits[0]["snippet"], sample_hits[1]["snippet"]]
+    ans = _rule_based_answer("What is the revenue trend?", blocks)
+    assert "10%" in ans or "revenue" in ans
 
-if __name__ == "__main__":
-    test_basic_rule_answer_no_llm()
-    test_empty_hits_graceful()
-    test_messy_snippet_cleanup()
-    print("All tests ran.")
+
+def test_clean_snippet_removes_noise():
+    dirty = "  Revenue   \t increased ││ by 5% ●● due to growth \n\n in demand "
+    clean = _clean_snippet(dirty)
+    assert "│" not in clean and "●" not in clean
+    assert "Revenue" in clean and "5%" in clean
+
+
+def test_llm_prompt_contains_context(sample_hits):
+    blocks = [h["snippet"] for h in sample_hits]
+    prompt = _build_llm_prompt("What happened?", blocks)
+    assert "Context:" in prompt
+    assert "What happened?" in prompt
+    assert "SEC filings" in prompt
+
+
+def test_answer_rule_based_only(sample_hits):
+    # 不调用 LLM
+    ans, reasoning, cites = answer_textual_or_mixed(
+        "Explain revenue change", sample_hits, filters={}, use_llm=False
+    )
+    assert isinstance(ans, str)
+    assert "规则拼接" in reasoning
+    assert cites and isinstance(cites, list)
+
+
+def test_answer_with_llm(monkeypatch, sample_hits):
+    # 模拟 llm_summarize 返回值
+    monkeypatch.setattr(
+        "src.qa.hybrid_qa.llm_summarize", lambda prompt, **kw: "This is a mock summary."
+    )
+    ans, reasoning, cites = answer_textual_or_mixed(
+        "Explain revenue change", sample_hits, filters={}, use_llm=True
+    )
+    assert "mock summary" in ans.lower()
+    assert "LLM" in reasoning
+    assert cites and all("ticker" in c for c in cites)
+
+
+def test_answer_with_empty_hits():
+    ans, reasoning, cites = answer_textual_or_mixed(
+        "What is revenue?", [], filters={}, use_llm=False
+    )
+    assert "无法给出充分的信息" in ans
+    assert cites == []

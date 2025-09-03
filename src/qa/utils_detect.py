@@ -4,81 +4,81 @@ from typing import Dict, Any, List, Tuple, Optional
 import re
 from datetime import datetime, timedelta
 import calendar
+
 # -----------------------------
-# 0) 全局同义词/别名表（可按需扩展）
+# 0) Global alias table (extend as needed)
 # -----------------------------
 ALIAS: Dict[str, List[str]] = {
     "revenue": [
-        "revenue", "revenues", "sales", "net sales", "total net sales",
-        "turnover", "营业收入", "营收"
+        "revenue", "revenues", "sales", "net sales", "total net sales", "turnover"
     ],
     "net_income": [
-        "net income", "profit", "net profit", "earnings", "net earnings",
-        "净利润", "利润", "收益"
+        "net income", "profit", "net profit", "earnings", "net earnings"
     ],
     "cash": [
-        "cash", "cash and cash equivalents", "cash & cash eq",
-        "现金", "现金等价物"
+        "cash", "cash and cash equivalents", "cash & cash equivalents", "cash equivalents"
     ],
-    # 你可以继续加：gross margin, operating income, opex, capex, ...
+    # add more: gross margin, operating income, opex, capex, etc.
 }
 
-# 变化类型关键词（中文/英文）
-KW_NUMERIC = [
-    "同比", "环比", "增长", "下降", "变动", "变化", "增幅", "减少", "qoq", "yoy",
-    "year over year", "quarter over quarter", "increase", "decrease",
-    "difference", "diff", "change", "rate", "%"
-]
+# Signal keywords
 KW_REASON = [
-    "原因", "驱动", "影响因素", "why", "because", "due to", "drivers", "explain",
-    "主要", "导致", "贡献度"
-]
-KW_AMOUNT = [
-    "多少", "金额", "数值", "比例", "百分比", "rate", "ratio", "percent", "%"
+    "why", "because", "due to", "drivers", "driver", "explain", "explanation",
+    "factors", "reason", "reasons", "impact", "contributed", "attributed"
 ]
 
-RE_NUMBER = re.compile(r"[-+]?\d+([,]\d{3})*(\.\d+)?\s*%?")  # 包含百分号的数字
+# Patterns indicating numeric intent / math-y questions
+KW_NUMERIC_HARD = [
+    "yoy", "qoq", "year over year", "quarter over quarter", "%"
+]
+KW_NUMERIC_SOFT = [
+    "increase", "decrease", "growth", "decline", "change", "difference", "diff", "rate",
+    "percent", "percentage", "ratio"
+]
 
+RE_NUMBER = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*%?")
 
 # -----------------------------
-# 1) 意图判定：numeric / textual / mixed
+# 1) Query type detection: numeric / textual / mixed
 # -----------------------------
 def detect_query_type(query: str, hits=None) -> str:
     q = (query or "").lower()
 
-    explicit_math = any(k in q for k in ["yoy","同比","qoq","环比","year over year","quarter over quarter","%"]) or bool(RE_NUMBER.search(q))
+    explicit_math = any(k in q for k in KW_NUMERIC_HARD) or bool(RE_NUMBER.search(q))
     reason_kw     = any(k in q for k in KW_REASON)
-    soft_numeric  = any(k in q for k in ["increase","decrease","growth","变化","变动","增幅"])
+    soft_numeric  = any(k in q for k in KW_NUMERIC_SOFT)
 
     if reason_kw and not explicit_math:
-        return "textual"               # 解释为主、没有明确数学指令 → textual
+        return "textual"          # explanatory without explicit math
     if explicit_math and reason_kw:
         return "mixed"
     if explicit_math:
         return "numeric"
 
-    # 没有明确数学，仅有“increase/decrease”这类软信号：
+    # No explicit math; soft numeric wording only → safer to treat as textual
     if soft_numeric:
-        return "textual"               # 更保守：没有数字/百分号就当 textual
+        return "textual"
 
-    # 命中类型启发（可留）
+    # Heuristic from hits (optional)
     if hits:
-        numeric_like = sum(1 for h in hits[:5] if (h.get("meta", {}).get("file_type") or "") in ("fact","cal","table"))
+        numeric_like = sum(
+            1 for h in hits[:5]
+            if (h.get("meta", {}).get("file_type") or "") in ("fact", "cal", "table")
+        )
         if numeric_like >= 3:
             return "numeric"
+
     return "textual"
 
-
-
 # -----------------------------
-# 2) Query 扩展：加入别名（检索前可用）
+# 2) Query expansion with aliases (before retrieval)
 # -----------------------------
 def expand_with_alias(query: str, targets: Optional[List[str]] = None) -> str:
     """
-    将 query 扩展为包含主要目标的同义词，便于 BM25/向量检索召回。
-    例：
-      "AAPL 2023 revenue YoY" →
-      "AAPL 2023 revenue YoY (sales OR net sales OR turnover OR 营收 OR 营业收入)"
+    Expand the query by appending OR-clauses of synonyms for the target metrics.
+    Example:
+      "AAPL 2023 revenue YoY" ->
+      "AAPL 2023 revenue YoY (revenues OR sales OR net sales OR turnover)"
     """
     if not targets:
         targets = guess_targets_from_query(query)
@@ -88,33 +88,29 @@ def expand_with_alias(query: str, targets: Optional[List[str]] = None) -> str:
         syns = ALIAS.get(t, [])
         if not syns:
             continue
-        # 构造一个 OR 串
         clause = "(" + " OR ".join(sorted(set(syns))) + ")"
         expansions.append(clause)
 
-    q = query.strip()
+    q = (query or "").strip()
     if expansions:
         q = q + " " + " ".join(expansions)
     return q
-
 
 def guess_targets_from_query(query: str) -> List[str]:
     q = (query or "").lower()
     tgs: List[str] = []
     for k, syns in ALIAS.items():
-        for s in syns:
-            if s.lower() in q:
-                tgs.append(k)
-                break
-    return sorted(set(tgs)) or ["revenue"]  # 无匹配时给个常见缺省
-
+        if any(s.lower() in q for s in syns):
+            tgs.append(k)
+    return sorted(set(tgs)) or ["revenue"]  # default to a common target
 
 # -----------------------------
-# 3) 命中过滤：按目标指标筛 hits
+# 3) Hit filtering: keep hits aligned with a target metric
 # -----------------------------
 def filter_hits_by_target(hits: List[Dict[str, Any]], target: str) -> List[Dict[str, Any]]:
     """
-    依据 meta.concept / meta.label_search_tokens / snippet 与别名匹配，筛出更可能相关的命中。
+    Filter hits whose meta/snippet bag contains target aliases.
+    Preserves original order.
     """
     syns = set([target] + ALIAS.get(target, []))
     out: List[Dict[str, Any]] = []
@@ -127,27 +123,25 @@ def filter_hits_by_target(hits: List[Dict[str, Any]], target: str) -> List[Dict[
         ]).lower()
         if any(s.lower() in bag for s in syns):
             out.append(h)
-    # 保持原顺序（假设原先已按 score 排好）
     return out or hits
 
-
 # -----------------------------
-# 4) 跨期定位：上一年/上一季度
+# 4) Previous-period locator (YoY / QoQ)
 # -----------------------------
 def locate_previous_period(
     cur_meta: Dict[str, Any],
     prefer: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    输入：包含 {fy, fq, period_end 或 instant} 的 meta（尽量提供）
-    输出：{"fy": fy_prev, "fq": fq_prev, "period_end": "..."} （尽可能补全）
-    - prefer: "YoY"|"QoQ"|None；None 时自动推断（若 fq 存在 → QoQ，否则 YoY）
+    Input: meta with {fy, fq, period_end or instant}
+    Output: dict with previous period hints: {"fy", "fq", "period_end"} where possible.
+
+    prefer: "YoY" | "QoQ" | None (auto: if fq exists → QoQ else YoY)
     """
     fy = _to_int(cur_meta.get("fy"))
     fq = _fq_norm(cur_meta.get("fq"))
     pend = _parse_date(cur_meta.get("period_end") or cur_meta.get("instant"))
 
-    # 自动模式：有 fq → QoQ；否则 YoY
     mode = prefer or ("QoQ" if fq else "YoY")
 
     if mode == "QoQ" and fy and fq:
@@ -155,16 +149,12 @@ def locate_previous_period(
         pend_prev = _prev_quarter_date(pend) if pend else None
         return _pack_prev(fy_prev, fq_prev, pend_prev)
 
-    # YoY：季度或年报都 -1 年
-    if fy:
-        fy_prev = fy - 1
-    else:
-        fy_prev = None
+    # YoY: subtract one fiscal year; keep quarter if present
+    fy_prev = (fy - 1) if fy else None
     pend_prev = _shift_year(pend, years=-1) if pend else None
-    # 季度保持不变（若有）
     return _pack_prev(fy_prev, fq, pend_prev)
 
-
+# Helpers
 def _pack_prev(fy_prev: Optional[int], fq_prev: Optional[str], pend_prev: Optional[str]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     if fy_prev is not None:
@@ -175,26 +165,22 @@ def _pack_prev(fy_prev: Optional[int], fq_prev: Optional[str], pend_prev: Option
         out["period_end"] = pend_prev
     return out
 
-
 def _to_int(x) -> Optional[int]:
     try:
         return int(x)
     except Exception:
         return None
 
-
 def _fq_norm(fq: Any) -> Optional[str]:
     if not fq:
         return None
     s = str(fq).upper().strip()
-    # 常见写法：Q1/Q2/Q3/Q4、FY、FQ4 等
     if s in {"Q1", "Q2", "Q3", "Q4"}:
         return s
     m = re.match(r".*Q([1-4]).*", s)
     if m:
         return f"Q{m.group(1)}"
     return None
-
 
 def _prev_quarter(fy: int, fq: str) -> Tuple[int, str]:
     order = ["Q1", "Q2", "Q3", "Q4"]
@@ -204,7 +190,6 @@ def _prev_quarter(fy: int, fq: str) -> Tuple[int, str]:
     if idx == 0:
         return fy - 1, "Q4"
     return fy, order[idx - 1]
-
 
 def _parse_date(s: Any) -> Optional[datetime]:
     if not s:
@@ -217,19 +202,16 @@ def _parse_date(s: Any) -> Optional[datetime]:
             pass
     return None
 
-
 def _fmt_date(d: datetime) -> str:
     return d.strftime("%Y-%m-%d")
 
-
 def _shift_year(d: datetime, years: int = -1) -> str:
-    # 处理 2/29 等边界：若新日期非法，则回退到该月最后一天
     if not d:
         return ""
     try:
         return _fmt_date(d.replace(year=d.year + years))
     except ValueError:
-        # 简单兜底：向前回退 1 天直到合法（最多 3 次）
+        # e.g., Feb 29: back off by one day until valid (up to 3 tries)
         nd = d
         for _ in range(3):
             nd = nd - timedelta(days=1)
@@ -239,39 +221,28 @@ def _shift_year(d: datetime, years: int = -1) -> str:
                 continue
         return _fmt_date(nd)
 
-
-
-
 def _quarter_end(year: int, month: int) -> str:
-    # 返回 year, month 所在季度的季度末（3/6/9/12）的 yyyy-mm-dd
-    q = ((month - 1) // 3) + 1               # 1..4
-    end_m = q * 3                            # 3/6/9/12
+    q = ((month - 1) // 3) + 1   # 1..4
+    end_m = q * 3                # 3/6/9/12
     last = calendar.monthrange(year, end_m)[1]
     return f"{year:04d}-{end_m:02d}-{last:02d}"
 
 def _prev_quarter_date(d: Optional[datetime]) -> Optional[str]:
     if not d:
         return None
-    # 求当前季度
-    cur_q = ((d.month - 1) // 3) + 1         # 1..4
-    # 上一季度
+    cur_q = ((d.month - 1) // 3) + 1
     if cur_q == 1:
         year, q = d.year - 1, 4
     else:
         year, q = d.year, cur_q - 1
-    end_m = q * 3                            # 3/6/9/12
+    end_m = q * 3
     last = calendar.monthrange(year, end_m)[1]
     return f"{year:04d}-{end_m:02d}-{last:02d}"
 
-
-
 # -----------------------------
-# 5) 辅助：从 hits 猜目标（可选）
+# 5) Infer target from hits (optional)
 # -----------------------------
 def guess_target_from_hits(hits: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    若 query 不明确目标，可从命中概念/label 中猜测一个最常见目标。
-    """
     score: Dict[str, int] = {}
     for h in hits[:8]:
         meta = h.get("meta", {}) or {}

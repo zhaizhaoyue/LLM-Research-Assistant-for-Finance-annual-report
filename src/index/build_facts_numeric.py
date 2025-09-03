@@ -230,6 +230,6 @@ if __name__ == "__main__":
 
 
 '''
-python src/index/build_facts_numeric.py --clean-root data/clean --out-parquet data/chunked/facts_numeric.parquet
+python src/index/build_facts_numeric.py --clean-root data/clean --out-parquet data/index/facts_numeric.parquet
 
 '''

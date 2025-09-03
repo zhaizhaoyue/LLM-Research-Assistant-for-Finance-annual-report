@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#666
 # -*- coding: utf-8 -*-
 import json, re
 from pathlib import Path

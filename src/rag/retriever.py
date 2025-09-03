@@ -1,27 +1,267 @@
+# src/qa/retriever_hybrid.py  (你也可以仍叫原文件名)
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import json
-import math
 import re
-
+from datetime import datetime
 import faiss
 import numpy as np
 
-# —— BM25 为可选依赖（未安装则回退为 dense-only）
+# Optional BM25
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
 except Exception:
     BM25Okapi = None  # noqa: N816
 
-# —— SentenceTransformer（设备自动回退）
 from sentence_transformers import SentenceTransformer
 
+REVENUE_CONCEPTS = {
+    # US GAAP 常见
+    "us-gaap:SalesRevenueNet",
+    "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+    "us-gaap:Revenues",
+    # 发行人自定义里偶见的 “NetSales” 等（保守加入）
+    "aapl:NetSales",
+    "aapl:Revenue",  # 只是兜底，真命中不多
+    # IFRS 兼容
+    "ifrs-full:Revenue",
+}
 
-class FaissRetriever:
+REVENUE_CONCEPT_RE = re.compile(
+    r"^(?:us-gaap:(?:SalesRevenueNet|RevenueFromContractWithCustomer(?:ExcludingAssessedTax)?|Revenues)"
+    r"|ifrs-full:Revenue"
+    r"|[a-z0-9-]+:(?:NetSales|Revenue)s?)$",
+    re.IGNORECASE,
+)
+
+ANNUAL_FQ_TOKENS = {"FY", "Q4", "FQ4", "4", "Y"}
+_YEAR_RE = re.compile(r"(\d{4})")
+
+
+#-----------------------------时间过滤--------------------------------------------------------------
+def apply_numeric_filters_with_fallback(hits: List[Dict[str, Any]], year: int, form: str) -> List[Dict[str, Any]]:
+    # Step 1: 严格三步（form → 年份+年度口径 → 概念白名单）
+    step1 = filter_by_form(hits, form=form)
+    step1 = filter_by_year_and_period(step1, target_year=year, require_annual_like=True)
+    step1 = filter_by_revenue_concepts(step1)
+    if step1:
+        return step1
+
+    # Step 2: 放宽年度口径（FY/Q4/FQ4/4 失败时，允许没有 fq 或 duration 异常）
+    step2 = filter_by_form(hits, form=form)
+    step2 = filter_by_year_and_period(step2, target_year=year, require_annual_like=False)
+    step2 = filter_by_revenue_concepts(step2)
+    if step2:
+        return step2
+
+    # Step 3: 仅按 form+year（不做概念白名单），让后续“文本/表格兜底”还能接住
+    step3 = filter_by_form(hits, form=form)
+    step3 = filter_by_year_and_period(step3, target_year=year, require_annual_like=False)
+    if step3:
+        return step3
+
+    # Step 4（最终兜底）：只按 form，保留给 numeric_demo 的 fallback
+    step4 = filter_by_form(hits, form=form)
+    return step4
+
+
+def _to_year(hit: Dict[str, Any]) -> Optional[int]:
+    # 1) 先看 fy
+    fy = hit.get("fy")
+    if fy is not None:
+        # int 直接返回
+        if isinstance(fy, int):
+            return fy
+        # 字符串里若含4位数字（如 "2023"、"FY2023"）抽出来
+        if isinstance(fy, str):
+            m = _YEAR_RE.search(fy)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    pass
+
+    # 2) 看 years 列表（你们的 fact 常见这个）
+    years = hit.get("years")
+    if isinstance(years, (list, tuple)) and years:
+        # 取第一个能转成int的
+        for y in years:
+            try:
+                return int(y)
+            except Exception:
+                # y 可能是 "2023" 字符串
+                if isinstance(y, str):
+                    m = _YEAR_RE.search(y)
+                    if m:
+                        try:
+                            return int(m.group(1))
+                        except Exception:
+                            pass
+
+    # 3) 从日期字段推断
+    for k in ("period_end", "instant", "period_start"):
+        v = hit.get(k)
+        if not v:
+            continue
+        m = _YEAR_RE.search(str(v))
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                continue
+
+    # 都没有则 None
+    return None
+
+
+def _is_annual_like(hit: Dict[str, Any]) -> bool:
+    """把 FY、Q4、FQ4、4 统一视作年度口径；其他情况尽量再看 duration（如果你们有时长字段可以补上）。"""
+    fq = str(hit.get("fq") or "").upper()
+    if fq in ANNUAL_FQ_TOKENS:
+        return True
+    # 可选：若你们有 duration（天数）字段，可把 ~360±30 天视作年度
+    dur_days = hit.get("duration_days") or hit.get("duration")
+    try:
+        if dur_days and 330 <= int(dur_days) <= 400:
+            return True
+    except Exception:
+        pass
+    return False
+
+def filter_by_year_and_period(hits: List[Dict[str, Any]], target_year: int, require_annual_like: bool = True) -> List[Dict[str, Any]]:
+    out = []
+    for h in hits:
+        y = _to_year(h)
+        if y != target_year:
+            continue
+        if require_annual_like and not _is_annual_like(h):
+            continue
+        out.append(h)
+    return out
+
+def filter_by_form(hits: List[Dict[str, Any]], form: Optional[str]) -> List[Dict[str, Any]]:
+    if not form:
+        return hits
+    f = form.upper()
+    return [h for h in hits if str(h.get("form") or "").upper() == f]
+
+def filter_by_revenue_concepts(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for h in hits:
+        c = h.get("concept")
+        if not c:
+            continue
+        if c in REVENUE_CONCEPTS or REVENUE_CONCEPT_RE.match(c):
+            out.append(h)
+    return out
+
+#----------------------------------------------------------------------------------------------------
+def _tokenize_en(s: str) -> List[str]:
+    """English/number tokenization only."""
+    return re.findall(r"[a-z0-9$%\.]+", (s or "").lower())
+
+
+class _OneIndex:
+    """A single FAISS index + meta + optional BM25 built on the same corpus."""
+    def __init__(self, name: str, faiss_path: Path, meta_path: Path, enc: SentenceTransformer):
+        self.name = name
+        self.index = faiss.read_index(str(faiss_path))
+        with meta_path.open("r", encoding="utf-8") as f:
+            self.metas: List[Dict[str, Any]] = [json.loads(line) for line in f]
+        if self.index.ntotal != len(self.metas):
+            raise ValueError(f"[{name}] index.ntotal={self.index.ntotal} != metas={len(self.metas)}")
+
+        self.metric_type = getattr(self.index, "metric_type", faiss.METRIC_INNER_PRODUCT)
+        self.enc = enc
+
+        # BM25 build (optional)
+        self._bm25 = None
+        self._bm25_meta_ids: List[int] = []
+        if BM25Okapi is not None:
+            docs: List[List[str]] = []
+            for i, m in enumerate(self.metas):
+                t = m.get("text") or m.get("raw_text") or m.get("text_preview") or ""
+                toks = _tokenize_en(t)
+                if not toks:
+                    continue
+                self._bm25_meta_ids.append(i)
+                docs.append(toks)
+            if docs:
+                self._bm25 = BM25Okapi(docs)
+
+    def _encode(self, q: str) -> np.ndarray:
+        v = self.enc.encode([q], normalize_embeddings=True, show_progress_bar=False)
+        return v.astype("float32")
+
+    def _score_from_dist(self, dist: float) -> float:
+        # For IP, faiss returns similarity; for L2 use 1/(1+dist)
+        if self.metric_type == faiss.METRIC_INNER_PRODUCT:
+            return float(dist)
+        return 1.0 / (1.0 + float(dist))
+
+    def _passes_filter(self, m: Dict[str, Any], ticker: Optional[str], year: Optional[int], form: Optional[str]) -> bool:
+        if ticker and str(m.get("ticker", "")).upper() != ticker.upper():
+            return False
+        if year is not None:
+            fy = m.get("fy")
+            if fy is None or int(fy) != int(year):
+                return False
+        if form and str(m.get("form", "")).upper() != form.upper():
+            return False
+        return True
+
+    def _to_item(self, meta_idx: int, score: float) -> Dict[str, Any]:
+        m = self.metas[meta_idx]
+        text = m.get("text") or m.get("raw_text") or m.get("text_preview") or ""
+        return {
+            "chunk_id": m.get("chunk_id") or f"{m.get('accno','NA')}::{m.get('file_type','NA')}::idx::{meta_idx}",
+            "score": float(score),
+            "snippet": (text or "")[:600],
+            "meta": m,
+            "faiss_id": meta_idx,
+        }
+
+    def search_dense(self, query: str, top_k: int, ticker: Optional[str], year: Optional[int], form: Optional[str]) -> List[Dict[str, Any]]:
+        qv = self._encode(query)
+        D, I = self.index.search(qv, max(top_k * 4, top_k))
+        out: List[Dict[str, Any]] = []
+        for dist, idx in zip(D[0], I[0]):
+            if idx < 0:
+                continue
+            m = self.metas[idx]
+            if not self._passes_filter(m, ticker, year, form):
+                continue
+            out.append(self._to_item(idx, self._score_from_dist(dist)))
+            if len(out) >= top_k:
+                break
+        return out
+
+    def search_bm25(self, query: str, top_k: int, ticker: Optional[str], year: Optional[int], form: Optional[str]) -> List[Dict[str, Any]]:
+        if self._bm25 is None:
+            return []
+        scores = self._bm25.get_scores(_tokenize_en(query))  # ndarray (len == len(_bm25_meta_ids))
+        if np.all(scores == 0):
+            return []
+        order = np.argsort(scores)[::-1]
+        out: List[Dict[str, Any]] = []
+        for local_i in order[: max(top_k * 4, top_k)]:
+            meta_i = self._bm25_meta_ids[local_i]
+            m = self.metas[meta_i]
+            if not self._passes_filter(m, ticker, year, form):
+                continue
+            out.append(self._to_item(meta_i, float(scores[local_i])))
+            if len(out) >= top_k:
+                break
+        return out
+
+
+class HybridRetriever:
     """
-    纯向量检索器：加载 hnsw.index + meta.jsonl
-    支持按 ticker/year/form 等元数据过滤；支持返回 top_k 候选（含 meta）
+    Multi-index hybrid retriever:
+      - Loads two indices: ip_bge_fact.faiss + ip_bge_fact.meta.jsonl, ip_bge_text.faiss + ip_bge_text.meta.jsonl
+      - Dense + (optional) BM25 per index
+      - RRF fusion across dense & BM25, and across indexes if target="both"
     """
     def __init__(
         self,
@@ -31,138 +271,32 @@ class FaissRetriever:
     ):
         self.index_dir = Path(index_dir)
 
-        # 1) 读取索引与 meta
-        index_path = self.index_dir / "hnsw.index"
-        meta_path = self.index_dir / "meta.jsonl"
-        if not index_path.exists():
-            raise FileNotFoundError(f"FAISS index not found: {index_path}")
-        if not meta_path.exists():
-            raise FileNotFoundError(f"Meta file not found: {meta_path}")
-
-        self.index = faiss.read_index(str(index_path))
-        self.metric_type = getattr(self.index, "metric_type", faiss.METRIC_L2)
-
-        self.metas: List[Dict[str, Any]] = []
-        with meta_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                self.metas.append(json.loads(line))
-
-        # 2) 加载编码器（设备自动回退）
+        # encoder (auto-fallback to CPU if device not available)
         try:
             self.enc = SentenceTransformer(model_name, device=device)
         except Exception:
-            # 例如无 CUDA 环境，自动退回 CPU
             self.enc = SentenceTransformer(model_name, device="cpu")
 
         self.dim = self.enc.get_sentence_embedding_dimension()
 
-    def _encode_q(self, q: str) -> np.ndarray:
-        v = self.enc.encode([q], normalize_embeddings=True, show_progress_bar=False)
-        return v.astype("float32")
+        self.idxs: Dict[str, _OneIndex] = {}
+        for name in ("fact", "text"):
+            fpath = self.index_dir / f"ip_bge_{name}.faiss"
+            mpath = self.index_dir / f"ip_bge_{name}.meta.jsonl"
+            if fpath.exists() and mpath.exists():
+                self.idxs[name] = _OneIndex(name, fpath, mpath, self.enc)
 
-    def _passes_filter(
-        self,
-        m: Dict[str, Any],
-        ticker: Optional[str],
-        year: Optional[int],
-        form: Optional[str],
-    ) -> bool:
-        if ticker and str(m.get("ticker", "")).upper() != ticker.upper():
-            return False
-        if year is not None:
-            # 元数据里常见字段名是 fy（财政年）。保留你原有的严格过滤。
-            fy = m.get("fy")
-            if fy is None or int(fy) != int(year):
-                return False
-        if form and str(m.get("form", "")).upper() != form.upper():
-            return False
-        return True
+        if not self.idxs:
+            raise FileNotFoundError(f"No index loaded under {self.index_dir}")
 
-    def _faiss_dist_to_score(self, dist: float) -> float:
-        """
-        将 FAISS 返回的距离转换为“越大越好”的相似度分数：
-        - Inner Product：dist 已是相似度（越大越好）
-        - L2：距离越小越相似 → 取负号作为分数
-        """
-        if self.metric_type == faiss.METRIC_INNER_PRODUCT:
-            return float(dist)
-        # 其他情况一律按距离越小越好 → 取负
-        return -float(dist)
+        # optional: global meta (not required)
+        self.global_meta: List[Dict[str, Any]] = []
+        gmeta = self.index_dir / "ip_bge.meta.jsonl"
+        if gmeta.exists():
+            with gmeta.open("r", encoding="utf-8") as f:
+                self.global_meta = [json.loads(line) for line in f]
 
-    def search(
-        self,
-        query: str,
-        top_k: int = 50,
-        ticker: Optional[str] = None,
-        year: Optional[int] = None,
-        form: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """返回 [{'text':..., 'score':..., 'meta':{...}, 'faiss_id': int}]"""
-        qv = self._encode_q(query)
-        # 多取一些再做过滤
-        D, I = self.index.search(qv, max(top_k * 4, top_k))
-        cand: List[Dict[str, Any]] = []
-        for dist, idx in zip(D[0], I[0]):
-            if idx < 0:
-                continue
-            m = self.metas[idx]
-            if not self._passes_filter(m, ticker, year, form):
-                continue
-
-            score = self._faiss_dist_to_score(float(dist))
-            cand.append(
-                {
-                    "text": m.get("text_preview") or m.get("text") or m.get("raw_text") or "",
-                    "score": score,
-                    "meta": m,
-                    "faiss_id": int(idx),
-                }
-            )
-            if len(cand) >= top_k:
-                break
-        return cand
-
-
-class HybridRetriever(FaissRetriever):
-    """
-    dense + BM25；RRF 融合
-    如果没有可用文本或未安装 rank_bm25，则自动回退 dense-only
-    """
-    def __init__(
-        self,
-        index_dir: str | Path,
-        corpus_texts: Optional[List[str]] = None,
-        **kwargs,
-    ):
-        super().__init__(index_dir, **kwargs)
-
-        # 1) 收集文本
-        if corpus_texts is None:
-            texts_raw: List[str] = []
-            for m in self.metas:
-                t = m.get("text") or m.get("raw_text") or m.get("text_preview") or ""
-                texts_raw.append(t or "")
-        else:
-            texts_raw = corpus_texts
-
-        # 2) 过滤空文本并建立映射：bm25_id -> meta_id
-        self._bm25_meta_ids: List[int] = []
-        bm25_docs: List[List[str]] = []
-        for meta_id, t in enumerate(texts_raw):
-            toks = self._tokenize(t)
-            if not toks:
-                continue
-            self._bm25_meta_ids.append(meta_id)
-            bm25_docs.append(toks)
-
-        # 3) 构建 BM25 或标记为空
-        if bm25_docs and BM25Okapi is not None:
-            self._bm25 = BM25Okapi(bm25_docs)
-        else:
-            self._bm25 = None  # 没有可用文本或未安装 rank_bm25
-
-    # ----------------- 公共方法 -----------------
-
+    # ----------------- Public API -----------------
     def search_hybrid(
         self,
         query: str,
@@ -172,135 +306,71 @@ class HybridRetriever(FaissRetriever):
         form: Optional[str] = None,
         rr_k_dense: int = 100,
         rr_k_bm25: int = 100,
+        target: str = "both",  # "fact" | "text" | "both"
     ) -> List[Dict[str, Any]]:
+        """Return unified hits: [{chunk_id, score, snippet, meta, faiss_id}, ...]"""
+        targets = [target] if target in ("fact", "text") else [k for k in ("fact", "text") if k in self.idxs]
+
+        # collect candidates per target
+        fused_all: List[Dict[str, Any]] = []
+        for t in targets:
+            idx = self.idxs[t]
+            dense = idx.search_dense(query, rr_k_dense, ticker, year, form)
+            bm25 = idx.search_bm25(query, rr_k_bm25, ticker, year, form)
+
+            # RRF within this target
+            fused = self._rrf_fuse(dense, bm25)
+            # 标注来源，便于调试
+            for it in fused:
+                it.setdefault("meta", {}).setdefault("_source_index", t)
+            fused_all.extend(fused)
+
+        # if both, fuse again across targets
+        if len(targets) > 1:
+            fused_all = self._rrf_fuse(fused_all, [])  # 单次 RRF 以 rank 融合
+        # sort by score desc and trim
+        fused_all.sort(key=lambda x: x["score"], reverse=True)
+        return fused_all[:top_k]
+
+    # ----------------- Internal -----------------
+    @staticmethod
+    def _rrf_fuse(primary: List[Dict[str, Any]], secondary: List[Dict[str, Any]], c: float = 60.0) -> List[Dict[str, Any]]:
         """
-        返回统一的 hits：[{chunk_id, score, snippet, meta, faiss_id}, ...]
-        - 先 dense（faiss）
-        - 若有 BM25 语料，则做 RRF 融合；否则直接 dense-only
+        Reciprocal Rank Fusion on two ranked lists.
         """
-        # 1) dense
-        dense_raw = super().search(query, top_k=rr_k_dense, ticker=ticker, year=year, form=form)
-        dense = [self._ensure_item_schema(d) for d in dense_raw]
-
-        # 2) 若无 BM25 → 直接返回 dense 前 top_k
-        if self._bm25 is None:
-            return dense[:top_k]
-
-        # 3) BM25 候选（在 bm25_docs 空间）
-        q_tokens = self._tokenize(query)
-        scores_bm25 = self._bm25.get_scores(q_tokens)  # np.ndarray
-        top_idx_local = np.argsort(scores_bm25)[::-1][:rr_k_bm25]
-
-        bm25_cand: List[Dict[str, Any]] = []
-        for local_i in top_idx_local:
-            meta_i = self._bm25_meta_ids[local_i]  # 映射回 meta 索引
-            m = self.metas[meta_i]
-            if not self._passes_filter(m, ticker, year, form):
-                continue
-            bm25_cand.append(self._to_item(meta_i, float(scores_bm25[local_i])))
-
-        # 4) RRF 融合
-        c = 60.0
-
         def _key(item: Dict[str, Any], fallback_rank: int):
-            # 尽量拿到可对齐的稳定 ID
-            return (
-                item.get("faiss_id")
-                or item.get("meta", {}).get("_id")
-                or item.get("chunk_id")
-                or fallback_rank
-            )
+            m = item.get("meta", {}) or {}
+            return item.get("faiss_id") or m.get("_id") or item.get("chunk_id") or fallback_rank
 
-        rank_dense: Dict[Any, int] = {}
-        for r, item in enumerate(dense, start=1):
-            rank_dense[_key(item, r)] = r
+        rank_a: Dict[Any, int] = { _key(it, i+1): i+1 for i, it in enumerate(primary) }
+        rank_b: Dict[Any, int] = { _key(it, i+1): i+1 for i, it in enumerate(secondary) }
+        ids = set(rank_a.keys()) | set(rank_b.keys())
 
-        rank_bm25: Dict[Any, int] = {}
-        for r, item in enumerate(bm25_cand, start=1):
-            rank_bm25[_key(item, r)] = r
-
-        ids = set(rank_dense.keys()) | set(rank_bm25.keys())
+        # need a way to map key back to item; keep best one we saw
+        by_key: Dict[Any, Dict[str, Any]] = {}
+        for i, it in enumerate(primary):
+            by_key[_key(it, i+1)] = it
+        for i, it in enumerate(secondary):
+            by_key.setdefault(_key(it, i+1), it)
 
         fused: List[Dict[str, Any]] = []
         for k in ids:
-            rrf = 0.0
-            if k in rank_dense:
-                rrf += 1.0 / (c + rank_dense[k])
-            if k in rank_bm25:
-                rrf += 1.0 / (c + rank_bm25[k])
-
-            # 把 key 映射回 metas 下标
-            meta_idx = self._resolve_meta_index(k)
-            fused.append(self._to_item(meta_idx, rrf))
+            score = 0.0
+            if k in rank_a:
+                score += 1.0 / (c + rank_a[k])
+            if k in rank_b:
+                score += 1.0 / (c + rank_b[k])
+            x = dict(by_key[k])
+            x["score"] = float(score)
+            fused.append(x)
 
         fused.sort(key=lambda x: x["score"], reverse=True)
-        return fused[:top_k]
-
-    # ----------------- 内部工具 -----------------
-
-    def _resolve_meta_index(self, any_id: Any) -> int:
-        """
-        将“_id 或 faiss_id 或 meta 下标”解析为 metas 的下标。
-        若 faiss_id 就是 meta 下标，则直接返回。
-        """
-        try:
-            any_id_int = int(any_id)
-            if 0 <= any_id_int < len(self.metas):
-                return any_id_int
-        except Exception:
-            pass
-        for idx, m in enumerate(self.metas):
-            if m.get("_id") == any_id:
-                return idx
-        # 最差回退
-        return 0
-
-    def _tokenize(self, s: str) -> List[str]:
-        """
-        英文/数字：按词切分；中文：粗粒度切成字符 + bigram。
-        """
-        s = (s or "").lower()
-        toks_en = re.findall(r"[a-z0-9$%\.]+", s)
-        zh = re.findall(r"[\u4e00-\u9fff]", s)
-        zh_bi = [a + b for a, b in zip(zh, zh[1:])]
-        return toks_en + zh + zh_bi
-
-    def _to_item(self, meta_idx: int, score: float) -> Dict[str, Any]:
-        m = self.metas[meta_idx]
-        text = m.get("text") or m.get("raw_text") or m.get("text_preview") or ""
-        return self._ensure_item_schema(
-            {
-                "chunk_id": m.get("chunk_id")
-                or f"{m.get('accno','NA')}::{m.get('file_type','NA')}::idx::{meta_idx}",
-                "score": float(score),
-                "snippet": text[:600],
-                "meta": m,
-                "faiss_id": meta_idx,
-            }
-        )
-
-    def _ensure_item_schema(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        out = {
-            "chunk_id": item.get("chunk_id")
-            or item.get("id")
-            or item.get("meta", {}).get("chunk_id"),
-            "score": float(item.get("score", 0.0)),
-            "snippet": item.get("snippet") or item.get("text") or "",
-            "meta": item.get("meta") or {},
-            "faiss_id": item.get("faiss_id"),
-        }
-        # 补全常用 meta 字段（保持现有键名，不强设默认值）
-        m = out["meta"]
-        for k in ["_id", "ticker", "form", "fy", "fq", "page_no", "source_path", "accno", "file_type"]:
-            if k not in m:
-                m[k] = m.get(k)
-        return out
-
+        return fused
 
 # ------------------------------
-# 对外暴露的函数式 wrapper
+# Singleton wrapper
 # ------------------------------
-_INDEX_DIR = "data/index/faiss_bge_base_en"
+_INDEX_DIR = "data/index"
 _retriever_singleton: Optional[HybridRetriever] = None
 
 def get_retriever() -> HybridRetriever:
@@ -309,7 +379,7 @@ def get_retriever() -> HybridRetriever:
         _retriever_singleton = HybridRetriever(index_dir=_INDEX_DIR)
     return _retriever_singleton
 
-def hybrid_search(query: str, filters: Dict[str, Any], topk: int = 8) -> List[Dict[str, Any]]:
+def hybrid_search(query: str, filters: Dict[str, Any], topk: int = 8, target: str = "both") -> List[Dict[str, Any]]:
     r = get_retriever()
     return r.search_hybrid(
         query=query,
@@ -317,4 +387,7 @@ def hybrid_search(query: str, filters: Dict[str, Any], topk: int = 8) -> List[Di
         ticker=filters.get("ticker"),
         year=filters.get("year"),
         form=str(filters.get("form") or "").upper() if filters.get("form") else None,
-        )
+        target=target,
+    )
+
+

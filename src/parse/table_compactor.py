@@ -1,3 +1,5 @@
+#555
+##compact tables 从 HTML 抽出 <table> → 精简成 CSV/Markdown
 from __future__ import annotations
 import argparse, json, re
 from io import StringIO
