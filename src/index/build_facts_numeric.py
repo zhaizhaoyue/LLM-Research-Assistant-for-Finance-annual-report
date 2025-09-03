@@ -213,8 +213,8 @@ def build_facts_numeric(clean_root: Path,
 def main():
     ap = argparse.ArgumentParser(description="Build numeric facts view from clean/fact files.")
     ap.add_argument("--clean-root", type=str, default="data/clean")
-    ap.add_argument("--out-parquet", type=str, default="data/clean/facts_numeric.parquet")
-    ap.add_argument("--out-jsonl", type=str, default="data/clean/facts_numeric.sample.jsonl")
+    ap.add_argument("--out-parquet", type=str, default="data/index/facts_numeric.parquet")
+    ap.add_argument("--out-jsonl", type=str, default="data/index/facts_numeric.sample.jsonl")
     ap.add_argument("--jsonl-sample", type=int, default=2000)
     args = ap.parse_args()
 
@@ -229,4 +229,7 @@ if __name__ == "__main__":
     main()
 
 
-#python src/index/build_facts_numeric.py --clean-root data/clean --out-parquet data/clean/facts_numeric.parquet
+'''
+python src/index/build_facts_numeric.py --clean-root data/clean --out-parquet data/chunked/facts_numeric.parquet
+
+'''
