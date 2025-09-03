@@ -1,4 +1,4 @@
-# src/rag/numeric_cache.py
+# numeric_cache 是 数值事实查询引擎，提供干净、快速、结构化的财报数值访问接口，避免 retriever/LLM 去“猜”数字。
 from __future__ import annotations
 import pandas as pd
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Iterable, Optional, Tuple, List, Dict, Any
 FQ_MAP = {1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4"}
 
 class FactsNumericCache:
-    def __init__(self, path: str | Path = "data/silver/facts_numeric.parquet"):
+    def __init__(self, path: str | Path = "data/index/facts_numeric.parquet"):
         self.path = Path(path)
         if not self.path.exists():
             self.df = None

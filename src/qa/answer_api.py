@@ -206,6 +206,102 @@ def extract_yoy_from_snippet(snippet: str) -> Optional[dict]:
             return {"pct": pct, "yoy_abs": delta_abs}
     return None
 
+def _extract_fx_from_text(text: str) -> Optional[dict]:
+    """
+    从一句话/一小段里提取 FX 影响：
+    返回 {"dir": +1/-1, "pct": float|None, "abs": float|None}
+    """
+    if not text:
+        return None
+    t = " ".join(text.split())
+
+    direction = 0
+    pct = None
+    delta_abs = None
+
+    # 1) 先看“好/坏风向词”
+    for pat in FX_PATTERNS[:2]:
+        m = pat.search(t)
+        if m:
+            word = m.group(1).lower()
+            value = float(m.group(2))
+            direction = -1 if word in {"unfavorable", "negative", "headwind"} else 1
+            pct = value * direction
+            break
+
+    # 2) 再看 increased/decreased... due to FX
+    if pct is None:
+        m = FX_PATTERNS[2].search(t)
+        if m:
+            verb = m.group(1).lower()
+            value = float(m.group(2))
+            direction = -1 if verb in {"decreased", "reduced"} else 1
+            pct = value * direction
+
+    # 3) 金额影响（or $X billion）
+    m_money = FX_PATTERNS[3].search(t)
+    if m_money:
+        delta_abs = _money_to_number(m_money.group(1), m_money.group(2))
+        # 若尚未判定方向，简单依据上下文词汇
+        if direction == 0:
+            if re.search(r"\b(unfavorable|negative|headwind|decreased|reduced)\b", t, re.I):
+                direction = -1
+            elif re.search(r"\b(favorable|positive|tailwind|increased)\b", t, re.I):
+                direction = 1
+
+    # 4) USD 强弱词（仅作弱提示）
+    if direction == 0:
+        m_usd = FX_PATTERNS[4].search(t)
+        if m_usd:
+            word = m_usd.group(1).lower()
+            # 美元走强常见为不利（-1）；走弱常见为有利（+1）
+            direction = -1 if word in {"strength", "strengthened"} else 1
+
+    if pct is None and delta_abs is None and direction == 0:
+        return None
+
+    return {"dir": direction or (1 if (pct and pct > 0) else -1 if (pct and pct < 0) else 0),
+            "pct": pct,
+            "abs": delta_abs}
+
+def try_text_fallback_for_fx(top_hits: List[dict]) -> Optional[Tuple[dict, dict]]:
+    """
+    从 text 命中里抽 FX 影响。
+    返回 ({'pct': +/-x or None, 'abs': +/-$ or None}, cite_meta)
+    """
+    def _take(res: dict, meta: dict) -> Tuple[dict, dict]:
+        # 若只有绝对值但没方向，默认负向（更保守）；也可置 0
+        if res.get("abs") is not None and res.get("pct") is None and res.get("dir") == 0:
+            res["dir"] = -1
+        # 将符号施加到 abs/pct
+        sgn = res.get("dir", 0)
+        if sgn and res.get("pct") is not None: res["pct"] = sgn * abs(res["pct"])
+        if sgn and res.get("abs") is not None: res["abs"] = sgn * abs(res["abs"])
+        return res, (meta or {})
+
+    # 逐条片段
+    for h in top_hits or []:
+        snippet = h.get("snippet") or h.get("text") or ""
+        if not snippet:
+            continue
+        r = _extract_fx_from_text(snippet)
+        if r:
+            return _take(r, (h.get("meta") or h))
+
+    # 合并后全局匹配
+    merged = "  ".join((h.get("snippet") or h.get("text") or "") for h in top_hits or [])
+    if merged.strip():
+        r = _extract_fx_from_text(merged)
+        if r:
+            # 尽量找包含 FX 关键词的那条作为引用
+            for h in top_hits or []:
+                s = (h.get("snippet") or h.get("text") or "").lower()
+                if re.search(FX_RE, s):
+                    return _take(r, (h.get("meta") or h))
+            return _take(r, (top_hits[0].get("meta") or top_hits[0]))
+    return None
+
+
 
 def try_text_fallback_for_yoy(top_hits: list[dict]) -> Optional[Tuple[dict, dict]]:
     """
@@ -258,6 +354,45 @@ def try_text_fallback_for_yoy(top_hits: list[dict]) -> Optional[Tuple[dict, dict
             return res, (top_hits[0].get("meta") or top_hits[0])
 
     return None
+
+# === FX intent & patterns ===
+FX_KEYS = [
+    r"foreign exchange", r"\bfx\b", r"exchange rates?", r"currency", r"currencies",
+    r"foreign[- ]?currency", r"currency translation", r"usd strength", r"u\.s\. dollar (?:strength|weakness)"
+]
+FX_RE = re.compile("|".join(FX_KEYS), re.IGNORECASE)
+
+# 外汇影响模式（方向 & 百分比/金额）
+FX_PATTERNS = [
+    # unfavorable/negative/headwind ... of/by 3%
+    re.compile(r"\b(unfavorable|negative|headwind)\b[^\.]{0,80}?\b(?:of|by)?\s*(\d+(?:\.\d+)?)\s*%", re.I),
+    # favorable/positive/tailwind ... of/by 3%
+    re.compile(r"\b(favorable|positive|tailwind)\b[^\.]{0,80}?\b(?:of|by)?\s*(\d+(?:\.\d+)?)\s*%", re.I),
+    # ... increased/decreased/reduced ... by 3% ... due to foreign exchange/currency
+    re.compile(r"\b(increased|decreased|reduced)\b[^\.]{0,80}?\b(?:by)?\s*(\d+(?:\.\d+)?)\s*%[^\.]{0,80}?\b(?:due to|from)\b[^\.]{0,40}?\b(foreign exchange|currency)\b", re.I),
+    # money amount
+    re.compile(r"\b(?:impact|effect)\b[^$]{0,60}?\$?([\d\.,]+)\s*(billion|million|thousand|bn|mm|k)", re.I),
+    # wording: strength of the U.S. dollar / strengthened USD
+    re.compile(r"(strength|strengthened|weakened)\s+(?:of|in)?\s+the\s+u\.?s\.?\s+dollar", re.I),
+]
+
+def _is_fx_query(q: str) -> bool:
+    return bool(FX_RE.search(q or ""))
+
+def _format_value_by_unit(x: float, unit: Optional[str]) -> str:
+    """money → $#,###；其它 → #,###；尽量容错，不嵌套 f-string。"""
+    if x is None:
+        return "N/A"
+    try:
+        if unit == "money":
+            return f"${float(x):,.0f}"
+        # 非 money 也启用千分位
+        return f"{float(x):,.0f}"
+    except Exception:
+        try:
+            return f"{int(x):,}"
+        except Exception:
+            return str(x)
 
 
 def format_citations(metas: list[dict]) -> list[dict]:
@@ -318,7 +453,7 @@ def _dedupe_and_cap_hits(hits: List[Dict[str, Any]], topk: int = 8) -> List[Dict
     """对 hybrid_search 的命中做：按 chunk_id 去重 + 不同 file_type 分桶上限。"""
     seen = set()
     buckets = {}
-    CAP = {"text": 3, "fact": 5, "cal": 2, "def": 2}
+    CAP = {"text": 5, "fact": 5, "cal": 2, "def": 2}
     out: List[Dict[str, Any]] = []
     for h in hits or []:
         cid = h.get("chunk_id")
@@ -334,6 +469,18 @@ def _dedupe_and_cap_hits(hits: List[Dict[str, Any]], topk: int = 8) -> List[Dict
         if len(out) >= topk:
             break
     return out
+
+def _fill_filters_from_hits_if_missing(filters: Dict[str, Any], hits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    f = dict(filters or {})
+    if not f.get("ticker") or not f.get("form") or not f.get("year"):
+        for h in hits or []:
+            m = (h.get("meta") or {})
+            f.setdefault("ticker", m.get("ticker"))
+            f.setdefault("form", m.get("form"))
+            f.setdefault("year", m.get("fy") or m.get("fy_norm"))
+            if f.get("ticker") and f.get("form") and f.get("year"):
+                break
+    return f
 
 
 # ======================================================================
@@ -384,6 +531,27 @@ def _format_pct(x: float) -> str:
 
 def _format_money(x: float) -> str:
     return f"${x:,.0f}"
+
+def _format_value_by_unit(x, unit: Optional[str]) -> str:
+    """
+    统一把数值按单位格式化：
+      - unit == 'money' → 用 $ + 千分位（四舍五入到整数）
+      - 其他 → 仅千分位
+    绝不使用 's' 类型码，避免 `Cannot specify ',' with 's'.`
+    """
+    if x is None:
+        return "N/A"
+    try:
+        xv = float(x)
+        if unit == "money":
+            return f"${xv:,.0f}"
+        return f"{xv:,.0f}"
+    except Exception:
+        # 兜底
+        try:
+            return f"{int(x):,}"
+        except Exception:
+            return str(x)
 
 def _citation_from_fact_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -781,7 +949,10 @@ def _numeric_answer_pipeline(
             cits, disp = _rows_to_citations(rows, hits)
             cur, prv = rows[-1], rows[0]
             unit = cur.get("unit_std") or "money"
-            ans = f"YoY：{_format_pct(v)}（{fy-1}→{fy}：{_format_money(prv['value_std']) if unit=='money' else prv['value_std']:,} → {_format_money(cur['value_std']) if unit=='money' else cur['value_std']:,}）。"
+            ans = (
+                f"YoY：{_format_pct(v)}（{fy-1}→{fy}："
+                f"{_format_value_by_unit(prv['value_std'], unit)} → {_format_value_by_unit(cur['value_std'], unit)}）。"
+            )
             rsn = f"概念={concept}；ticker={ticker or 'NA'}；form={form or 'NA'}；fy={fy}。"
             return ans, rsn, cits, disp
 
@@ -806,14 +977,22 @@ def _numeric_answer_pipeline(
                         rows = [prv, cur]; err = None
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"QoQ：{_format_pct(v)}（{fy_prev} {fq_prev} → {fy_now} {fq_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = (
+                            f"QoQ：{_format_pct(v)}（{fy_prev} {fq_prev} → {fy_now} {fq_now}："
+                            f"{_format_value_by_unit(prv['value_std'], unit)} → {_format_value_by_unit(cur['value_std'], unit)}）。"
+                        )
+
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
 
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"QoQ：{_format_pct(v)}。"
+            ans = (
+                f"QoQ：{_format_pct(v)}（{fy_prev} {fq_prev} → {fy_now} {fq_now}："
+                f"{_format_value_by_unit(prv['value_std'], unit)} → {_format_value_by_unit(cur['value_std'], unit)}）。"
+            )
+
             rsn = f"概念={concept}；ticker={ticker or 'NA'}；form={form or 'NA'}；fy={fy}, fq={fq}。"
             return ans, rsn, cits, disp
 
@@ -833,14 +1012,15 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
-                        rsn = f"自救链成功：{note}"
+                        ans = f"差额：{_format_value_by_unit(v, unit)}。"
+
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             unit = rows[-1].get("unit_std") or "money"
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"差额：{_format_money(v) if unit=='money' else f'{v:,.4g}'}。"
+            ans = f"差额：{_format_value_by_unit(v, unit)}。"
+
             rsn = f"概念={concept}；ticker={ticker or 'NA'}；form={form or 'NA'}；FY 对 FY-1。"
             return ans, rsn, cits, disp
 
@@ -860,7 +1040,8 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"{concept} = {_format_value_by_unit(v, unit)}（期末/日期：{period}）。"
+
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
@@ -868,7 +1049,8 @@ def _numeric_answer_pipeline(
             unit = rows[-1].get("unit_std") or "money"
             cits, disp = _rows_to_citations(rows, hits)
             period = rows[-1].get("period_end") or rows[-1].get("instant")
-            ans = f"{concept} = {_format_money(v) if unit=='money' else f'{v:,.4g}'}（期末/日期：{period}）。"
+            ans = f"{concept} = {_format_value_by_unit(v, unit)}（期末/日期：{period}）。"
+
             rsn = f"概念={concept}；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 
@@ -888,14 +1070,14 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             unit = rows[-1].get("unit_std") or "money"
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"TTM（{concept}）= {_format_money(v) if unit=='money' else f'{v:,.4g}'}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"最近 4 季合计；ticker={ticker or 'NA'}；form={form or 'NA'}；截至 {fy} {fq}。"
             return ans, rsn, cits, disp
 
@@ -915,13 +1097,13 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"TTM YoY：{_format_pct(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"最近 4 季 vs 去年同期 4 季；ticker={ticker or 'NA'}；form={form or 'NA'}；截至 {fy} {fq}。"
             return ans, rsn, cits, disp
 
@@ -941,13 +1123,13 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"{years} 年 CAGR：{_format_pct(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"{fy-years}→{fy}；概念={concept}；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 
@@ -967,13 +1149,13 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"利润率：{_format_pct(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"{num}/{den}；{'TTM' if ttm else '单期'}；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 
@@ -993,13 +1175,13 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"费用占比：{_format_pct(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"{num}/{den}；{'TTM' if ttm else '单期'}；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 
@@ -1019,13 +1201,13 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"FCF = {_format_money(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"CFO - Capex；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 
@@ -1045,13 +1227,13 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
-            ans = f"FCF（TTM）= {_format_money(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"TTM CFO - TTM Capex；ticker={ticker or 'NA'}；form={form or 'NA'}；截至 {fy} {fq}。"
             return ans, rsn, cits, disp
 
@@ -1071,14 +1253,14 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
             flavor = "Diluted" if diluted else "Basic"
-            ans = f"EPS ({flavor}) = {v:.2f}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"{flavor} EPS；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 
@@ -1099,14 +1281,14 @@ def _numeric_answer_pipeline(
                         # 继续正常返回
                         cits, disp = _rows_to_citations(rows, hits)
                         unit = cur.get("unit_std") or "money"
-                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_money(prv['value_std']) if unit=='money' else f'{prv['value_std']:,}'} → {_format_money(cur['value_std']) if unit=='money' else f'{cur['value_std']:,}'}）。"
+                        ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
                         rsn = f"自救链成功：{note}"
                         return ans, rsn, cits, disp
                 # 自救失败
                 return None, f"信息不足：{err}" + (f" | {'; '.join(notes)}" if notes else ""), [], []
             cits, disp = _rows_to_citations(rows, hits)
             flavor = "Diluted" if diluted else "Basic"
-            ans = f"EPS YoY ({flavor})：{_format_pct(v)}。"
+            ans = f"YoY：{_format_pct(v)}（{fy_now-1}→{fy_now}：{_format_value_by_unit(x, unit)}）。"
             rsn = f"{flavor} EPS，{fy-1}→{fy}；ticker={ticker or 'NA'}；form={form or 'NA'}。"
             return ans, rsn, cits, disp
 

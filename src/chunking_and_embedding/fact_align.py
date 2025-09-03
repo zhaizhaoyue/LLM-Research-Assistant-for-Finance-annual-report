@@ -1,4 +1,19 @@
 #7
+'''
+从 data/compact_tables 读表格 CSV + meta。
+
+从 data/normalized 读 fact.jsonl。
+
+对齐：表格行名（account_text） → 概念（concept）。
+
+按表格的 FY/Q 列，找最近的 fact 值。
+
+输出新文件：
+
+table_i.meta.aligned.json
+
+里面会多一个 alignment 字段，记录匹配结果（行名、匹配概念、分数、表格值 vs fact 值）。
+'''
 from __future__ import annotations
 import argparse, json, re, gzip, sys
 from pathlib import Path
@@ -447,11 +462,11 @@ if __name__ == "__main__":
 
 python -m src.parse.fact_align `
   --compact_root data/compact_tables `
-  --facts data/normalized `
+  --facts data/index/facts_numeric.parquet `
   --min_score 65 `
   --limit_concepts 500 `
-  --debug_match `
-  --topk 5
+  --debug_match --topk 5 --no_currency_filter
+
 
 '''
 

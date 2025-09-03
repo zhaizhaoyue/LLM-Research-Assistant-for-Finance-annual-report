@@ -337,7 +337,10 @@ if __name__ == "__main__":
     main()
 
 
-# python src/parse/table_compactor.py `
-#   --raw_root data/raw_reports/standard `
-#   --out_root data/compact_tables `
-#   --both
+
+'''
+python src/parse/table_compactor.py `
+  --raw_root data/raw_reports/standard `
+  --out_root data/compact_tables `
+  --both
+'''
