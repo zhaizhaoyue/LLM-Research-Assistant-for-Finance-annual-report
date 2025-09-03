@@ -2,7 +2,7 @@
 import numpy as np
 from pathlib import Path
 from src.embed.encoder import TextEncoder
-from src.indexer.faiss_index import FaissHNSWIndex
+from src.index.faiss_index import FaissHNSWIndex
 
 INDEX_DIR = Path("data/index/faiss_bge_base_en")
 

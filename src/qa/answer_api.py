@@ -1144,21 +1144,21 @@ def answer_question(query: str, filters: Dict[str, Any]) -> Dict[str, Any]:
         hits = hybrid_search(query=q, filters=filters or {}, topk=8)
         hits = _dedupe_and_cap_hits(hits, topk=8)
 
-        # if DEBUG:
-        #     print("\n[DEBUG] top hits (trimmed):")
-        #     for h in hits[:5]:
-        #         m = (h.get("meta") or {})
-        #         snippet = (h.get("snippet") or h.get("text") or "")
-        #         snippet = re.sub(r"\s+", " ", snippet).strip()[:120]
-        #         print({
-        #             "chunk_id": h.get("chunk_id"),
-        #             "file_type": (m.get("file_type") or "text"),
-        #             "fy": (m.get("fy") or m.get("fy_norm")),
-        #             "fq": (m.get("fq") or m.get("fq_norm")),
-        #             "period_end": m.get("period_end"),
-        #             "concept": m.get("concept"),
-        #             "snippet": snippet
-        #         })
+        if DEBUG:
+            print("\n[DEBUG] top hits (trimmed):")
+            for h in hits[:5]:
+                m = (h.get("meta") or {})
+                snippet = (h.get("snippet") or h.get("text") or "")
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:120]
+                print({
+                    "chunk_id": h.get("chunk_id"),
+                    "file_type": (m.get("file_type") or "text"),
+                    "fy": (m.get("fy") or m.get("fy_norm")),
+                    "fq": (m.get("fq") or m.get("fq_norm")),
+                    "period_end": m.get("period_end"),
+                    "concept": m.get("concept"),
+                    "snippet": snippet
+                })
 
     except Exception as e:
         logger.exception("检索阶段异常")
@@ -1419,6 +1419,6 @@ if __name__ == "__main__":
 
 
 '''
-python -m src.qa.answer_api --q "What is the year-over-year revenue in 2023 in Apple??" 
+python -m src.qa.answer_api --q "How did foreign exchange rates impact Tesla's 2022 financial results??" 
 
 '''
