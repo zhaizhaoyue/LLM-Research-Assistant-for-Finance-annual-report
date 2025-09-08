@@ -3,7 +3,7 @@
 
 
 python -m src.rag.retriever.dense `
-  --q " APPLE YOY in 2023" `
+  --q " What are Apple’s main sources of revenue in its 2023 annual report?" `
   --ticker AAPL `
   --form 10-K `
   --year 2023 `
