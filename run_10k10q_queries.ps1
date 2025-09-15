@@ -1,8 +1,9 @@
 '''
 
 # Usage (PowerShell):
-   Set-ExecutionPolicy -Scope Process Bypass
-   .\run_10k10q_queries.ps1
+Set-ExecutionPolicy -Scope Process Bypass
+.\run_10k10q_queries.ps1 *> output.log
+
 
 '''
 python -m src.rag.retriever.hybrid `
