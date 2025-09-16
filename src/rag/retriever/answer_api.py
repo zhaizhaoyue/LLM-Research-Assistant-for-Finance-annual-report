@@ -4,8 +4,16 @@ RAG Answerer — plugs HybridRetrieverRRF into an LLM (OpenAI-compatible or Open
 Usage example:
 
 python -m src.rag.retriever.answer_api `
-  --query "What risks related to consumer demand did Mastercard highlight in its 2023 10-K" `
-  --ticker MA --form 10-K --year 2023 `
+  --query "What risks did Tesla mention in its 2023 10-K?" `
+  --ticker TSLA --form 10-K --year 2023 `
+  --index-dir data/index --content-dir data/chunked `
+  --model BAAI/bge-base-en-v1.5 `
+  --rerank-model cross-encoder/ms-marco-MiniLM-L-6-v2 `
+  --topk 8 --bm25-topk 200 --dense-topk 200 --ce-candidates 256 `
+  --w-bm25 1.0 --w-dense 2.0 --ce-weight 0.4 `
+  --llm-base-url https://api.deepseek.com/v1 `
+  --llm-model deepseek-chat `
+  --llm-api-key "sk-f6220301c405405a8ca5c65a06a75f7b" `
   --json-out
 
 """
@@ -628,11 +636,11 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2")
     ap.add_argument("--k", type=float, default=60.0)
-    ap.add_argument("--content-path", default="data/index")
-    ap.add_argument("--content-dir", default="data/chunked")
-    ap.add_argument("--show-chars", type=int, default=1200)
+    ap.add_argument("--content-path", default=None)
+    ap.add_argument("--content-dir", default=None)
+    ap.add_argument("--show-chars", type=int, default=800)
     ap.add_argument("--w-bm25", type=float, default=1.0)
-    ap.add_argument("--w-dense", type=float, default=1.7)
+    ap.add_argument("--w-dense", type=float, default=2.0)
     ap.add_argument("--ce-weight", type=float, default=0.5)
     ap.add_argument("--bm25-topk", type=int, default=200)
     ap.add_argument("--dense-topk", type=int, default=200)
@@ -645,9 +653,9 @@ def main():
     ap.add_argument("--year", type=int)
 
     # LLM configs
-    ap.add_argument("--llm-base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"))
-    ap.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "deepseek-chat"))
-    ap.add_argument("--llm-api-key", default=os.getenv("OPENAI_API_KEY", "sk-f6220301c405405a8ca5c65a06a75f7b"))
+    ap.add_argument("--llm-base-url", default=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+    ap.add_argument("--llm-model", default=os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    ap.add_argument("--llm-api-key", default=os.getenv("OPENAI_API_KEY", ""))
     ap.add_argument("--max-context-tokens", type=int, default=2400)
     ap.add_argument("--json-out", action="store_true", help="Print JSON only (no pretty).")
 
