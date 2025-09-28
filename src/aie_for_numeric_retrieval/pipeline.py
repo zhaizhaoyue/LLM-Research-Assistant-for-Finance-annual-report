@@ -21,7 +21,8 @@ from .segmentation import DocumentSegmenter, DocumentSegment
 from .retrieval import DocumentRetriever, RetrievalResult
 from .summarization import DocumentSummarizer, SummaryResult
 from .extraction import InformationExtractor, ExtractionTarget, ExtractionResult
-from ..models.llm_interface import LLMInterface
+from .financial_data_adapter import FinancialDataAdapter, FinancialDocument
+from src.aie_for_numeric_retrieval.models.llm_interface import LLMInterface
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,68 @@ class AIEPipeline:
             self._retriever_cache[document_id] = retr
         return retr
 
+    # -------- Numeric Retrieval Integration --------
+    def process_financial_document(self,
+                                  ticker: str,
+                                  year: int,
+                                  query: str,
+                                  extraction_targets: List[ExtractionTarget],
+                                  form_type: Optional[str] = None,
+                                  document_limit: int = 100) -> AIEPipelineResult:
+        """
+        处理财务文档进行数值检索
+        整合现有数据源，专门为数值检索任务优化
+        
+        Args:
+            ticker: 股票代码
+            year: 年份
+            query: 查询文本
+            extraction_targets: 提取目标
+            form_type: 表单类型 (10-K, 10-Q)
+            document_limit: 文档数量限制
+        """
+        t0 = _now()
+        document_id = f"{ticker}_{year}_{form_type or 'ALL'}_{int(time.time())}"
+        
+        # 初始化数据适配器
+        data_adapter = FinancialDataAdapter()
+        
+        # 加载财务文档
+        logger.info(f"Loading financial documents for {ticker} {year}")
+        financial_docs = data_adapter.load_documents_for_aie(
+            ticker=ticker,
+            year=year,
+            form_type=form_type,
+            limit=document_limit
+        )
+        
+        if not financial_docs:
+            logger.warning(f"No documents found for {ticker} {year}")
+            return AIEPipelineResult(
+                document_id=document_id,
+                query=query,
+                segments=[],
+                retrieved_segments=[],
+                summary=SummaryResult("", [], {"note": "no documents found"}),
+                extractions=[],
+                processing_time=_now() - t0,
+                stage_reports=[],
+                metadata={"success": False, "error": "No documents found"}
+            )
+        
+        # 合并文档内容
+        combined_content = "\n\n".join([doc.content for doc in financial_docs[:10]])  # 限制内容长度
+        
+        logger.info(f"Processing {len(financial_docs)} financial documents")
+        
+        # 使用现有的处理流程
+        return self.process_document(
+            document_text=combined_content,
+            query=query,
+            extraction_targets=extraction_targets,
+            document_id=document_id
+        )
+    
     # -------- Single Document --------
     def process_document(self,
                          document_text: str,

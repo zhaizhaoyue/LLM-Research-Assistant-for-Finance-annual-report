@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union, Iterable
 
 from .summarization import SummaryResult
-from ..models.llm_interface import LLMInterface
+from src.aie_for_numeric_retrieval.models.llm_interface import LLMInterface
 
 logger = logging.getLogger(__name__)
 

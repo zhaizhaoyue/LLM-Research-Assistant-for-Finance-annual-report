@@ -1,1 +1,0 @@
-#调用 Huggingface TAPAS 模型（专门做表格问答）。

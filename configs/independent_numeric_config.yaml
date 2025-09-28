@@ -1,0 +1,136 @@
+# 独立数值检索Pipeline配置
+# 完全独立于RAG文本检索系统
+
+# 数据源配置
+data_sources:
+  # 主要数据源：结构化facts数据
+  facts:
+    enabled: true
+    path: "data/processed"
+    priority: 1
+    description: "GAAP标准化数值事实，高精度"
+  
+  # 辅助数据源：表格数据
+  tables:
+    enabled: true
+    path: "data/compact_tables"
+    priority: 2
+    description: "CSV表格数据，提供上下文和细分信息"
+  
+  # 备用数据源：原始报告
+  raw_reports:
+    enabled: false  # 暂时禁用，性能考虑
+    path: "data/raw_reports"
+    priority: 3
+    description: "原始HTML/XML报告，完整但需要解析"
+
+# 数据库配置
+database:
+  type: "sqlite"
+  path: ":memory:"  # 使用内存数据库以提高性能
+  
+  # 索引配置
+  indexes:
+    - "facts(concept)"
+    - "facts(ticker, period_fy)"
+    - "facts(value_num)"
+    - "table_facts(ticker, year)"
+    - "table_facts(row_header, col_header)"
+
+# 概念映射配置
+concept_mapping:
+  # 收入相关概念
+  revenue:
+    gaap_concepts:
+      - "us-gaap:Revenues"
+      - "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+      - "us-gaap:SalesRevenueNet"
+    table_keywords:
+      - "revenue"
+      - "sales"
+      - "net sales"
+    
+  # 利润相关概念
+  net_income:
+    gaap_concepts:
+      - "us-gaap:NetIncomeLoss"
+      - "us-gaap:NetIncomeLossAvailableToCommonStockholdersBasic"
+    table_keywords:
+      - "net income"
+      - "profit"
+      - "earnings"
+  
+  # 资产相关概念
+  total_assets:
+    gaap_concepts:
+      - "us-gaap:Assets"
+    table_keywords:
+      - "total assets"
+      - "assets"
+  
+  cash:
+    gaap_concepts:
+      - "us-gaap:Cash"
+      - "us-gaap:CashAndCashEquivalentsAtCarryingValue"
+      - "us-gaap:CashCashEquivalentsAndShortTermInvestments"
+    table_keywords:
+      - "cash"
+      - "cash equivalents"
+
+# 查询配置
+query:
+  # 默认查询参数
+  defaults:
+    max_results: 10
+    timeout_seconds: 5
+    
+  # 评分权重
+  scoring:
+    concept_match: 2.0      # 概念匹配得分
+    value_magnitude: 1.0    # 数值大小得分
+    source_quality: 1.5     # 数据源质量得分
+    context_relevance: 1.0  # 上下文相关性得分
+  
+  # 过滤器
+  filters:
+    min_value: null         # 最小数值过滤
+    max_value: null         # 最大数值过滤
+    required_units: []      # 必需单位
+    excluded_concepts: []   # 排除概念
+
+# 性能配置
+performance:
+  # 数据加载
+  batch_size: 1000          # 批量处理大小
+  max_files_per_load: 100   # 每次加载的最大文件数
+  
+  # 查询优化
+  use_query_cache: true     # 启用查询缓存
+  cache_size: 1000          # 缓存大小
+  parallel_queries: true    # 并行查询
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # 性能监控
+  log_query_time: true      # 记录查询时间
+  log_data_stats: true      # 记录数据统计
+
+# 验证配置
+validation:
+  # 数据质量检查
+  check_data_completeness: true
+  min_facts_per_ticker: 10
+  
+  # 结果验证
+  cross_validate_sources: true  # 交叉验证不同数据源
+  tolerance_percentage: 5.0     # 数值差异容忍度
+
+# 输出配置
+output:
+  format: "json"            # 输出格式
+  include_metadata: true    # 包含元数据
+  include_scores: true      # 包含评分信息
+  standardize_units: true   # 标准化单位

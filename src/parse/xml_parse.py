@@ -555,8 +555,10 @@ def iter_instance_files(indir: Path) -> List[Path]:
 
 # ---------------- main parse (REWRITTEN) ----------------
 def parse_one(file_path: Path) -> pd.DataFrame:
+    print(f"[dbg] parse_one: loading {file_path}")
     ctrl = Cntlr.Cntlr(logFileName=None)
     mx = load_instance(ctrl, str(file_path))
+    print(f"[dbg] parse_one: loaded model, facts count: {len(mx.facts) if mx and hasattr(mx, 'facts') else 'N/A'}")
     rows = []
 
     # 1) 文件名/路径推断 + 2) 父目录兜底 + 3) DEI 兜底
@@ -649,6 +651,7 @@ def parse_one(file_path: Path) -> pd.DataFrame:
 
             # —— 概念与取值 ——
             qname=qname,
+            concept=qname,                # 兼容下游期望的列名
             value=value,                 # 若后续转为 value_num，可在 main() 里统一处理
             value_raw=value_raw,
             value_num=value_num,         # 这里是 arelle 的 xValue（可能为 None），main() 再标准化
@@ -719,23 +722,39 @@ def main():
         raise SystemExit(f"No instance files found in {indir}")
 
     for fp in files:
+        if not args.quiet:
+            print(f"[dbg] processing file: {fp}")
         try:
             df = parse_one(fp)
+            if not args.quiet:
+                print(f"[dbg] parsed {len(df)} facts from {fp.name}")
         except Exception as e:
             print(f"[fail] {fp.name}: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             continue
         if df.empty:
+            if not args.quiet:
+                print(f"[dbg] empty dataframe for {fp.name}")
             continue
         # ========== Silver → Gold 轻加工：数值与维度归档 ==========
         df["value_num"] = df.apply(lambda r: to_float_maybe(r.get("value")), axis=1)
 
-        percent_mask = (
+        # 百分比归一：仅在明显为百分号或数值大于 1 的情况下除以 100
+        percent_mask_base = (
             (df["unit_family"].fillna("") == "percent")
             | df["value_display"].fillna("").str.contains("%", regex=False)
             | df["qname"].fillna("").str.lower().str.contains("percent|percentage")
         )
-        df.loc[percent_mask & df["value_num"].notna(), "value_num"] = \
-            df.loc[percent_mask & df["value_num"].notna(), "value_num"] / 100.0
+        to_divide = percent_mask_base & df["value_num"].notna() & (df["value_num"].abs() > 1.0)
+        df.loc[to_divide, "value_num"] = df.loc[to_divide, "value_num"] / 100.0
+
+        # 输出清洗后的数值列（供校验/下游使用）
+        df["value_num_clean"] = df["value_num"]
+
+        # 兼容列名：提供 unit 列（优先 normalized，其次原 unitRef）
+        if "unit" not in df.columns:
+            df["unit"] = df["unit_normalized"].where(df["unit_normalized"].notna(), df["unitRef"]) 
 
         if "value" in df.columns:
             df = df.drop(columns=["value"])
@@ -767,12 +786,16 @@ def main():
         if not form:
             m_form = FORM_RE.search(Path(fp).name)
             form = m_form.group(1).upper() if m_form else "NA"
+            if not args.quiet:
+                print(f"[dbg] extracted form from filename: {form} (file: {Path(fp).name})")
         else:
             form = form.upper()
 
         accno = first_nonnull(df, "accno", None) or "ACCNO_NA"
 
         out_dir = outdir / ticker / year / f"{form}_{accno}"
+        if not args.quiet:
+            print(f"[dbg] creating output dir: {out_dir}")
         out_dir.mkdir(parents=True, exist_ok=True)
 
         fmts = [f.lower() for f in (args.fmt or ["parquet","jsonl"])]
@@ -782,13 +805,13 @@ def main():
                 df_to_save = normalize_for_parquet(df)
 
             if fmt == "parquet":
-                out_path = out_dir / "facts.parquet"
+                out_path = out_dir / "fact.parquet"
                 df_to_save.to_parquet(out_path, index=False)
             elif fmt == "csv":
-                out_path = out_dir / "facts.csv"
+                out_path = out_dir / "fact.csv"
                 df_to_save.to_csv(out_path, index=False, encoding="utf-8")
             elif fmt == "jsonl":
-                out_path = out_dir / "facts.jsonl"
+                out_path = out_dir / "fact.jsonl"
                 # JSONL 可以保留原 df，这样 Decimal 会被自动序列化为字符串；如果你想统一也可用 df_to_save
                 df.to_json(out_path, orient="records", lines=True, force_ascii=False)
             else:

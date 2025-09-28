@@ -31,7 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .segmentation import DocumentSegment
 from .retrieval import RetrievalResult
-from ..models.llm_interface import LLMInterface
+from src.aie_for_numeric_retrieval.models.llm_interface import LLMInterface
 
 logger = logging.getLogger(__name__)
 

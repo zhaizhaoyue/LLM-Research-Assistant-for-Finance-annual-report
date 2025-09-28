@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Financial Data Adapter for Existing Text Retrieval System
-
-This adapter converts various existing data formats to AIE framework format
-without changing the original data structure.
+Financial Data Adapter - 整合现有数据源
+适配不同的财务数据格式，为AIE系统提供统一接口
 """
 
 import json
 import csv
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Iterator
 from dataclasses import dataclass
 import logging
 
@@ -18,23 +16,288 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class FinancialDocument:
-    """Standardized financial document format for AIE framework"""
+    """统一的财务文档数据结构"""
     document_id: str
-    document_text: str
-    query: str
-    company: str
-    ticker: str
-    year: str
-    form_type: str
+    content: str
     metadata: Dict[str, Any]
-    ground_truth: Optional[Dict[str, Any]] = None
+    ticker: Optional[str] = None
+    form_type: Optional[str] = None
+    fiscal_year: Optional[int] = None
+    fiscal_quarter: Optional[str] = None
+    
+    @classmethod
+    def from_text_chunk(cls, chunk_data: Dict[str, Any]) -> 'FinancialDocument':
+        """从text_chunk数据创建文档"""
+        meta = chunk_data.get("meta", {})
+        return cls(
+            document_id=chunk_data.get("id", ""),
+            content=chunk_data.get("content", ""),
+            metadata=meta,
+            ticker=meta.get("ticker"),
+            form_type=meta.get("form"),
+            fiscal_year=meta.get("fy"),
+            fiscal_quarter=meta.get("fq")
+        )
+    
+    @classmethod  
+    def from_facts_data(cls, facts_data: Dict[str, Any]) -> 'FinancialDocument':
+        """从facts数据创建文档"""
+        # 构建描述性文本
+        content_parts = []
+        if facts_data.get("label_text"):
+            content_parts.append(f"Label: {facts_data['label_text']}")
+        
+        qname = facts_data.get("qname", "")
+        if qname:
+            content_parts.append(f"Concept: {qname}")
+        
+        value_display = facts_data.get("value_display")
+        if value_display:
+            content_parts.append(f"Value: {value_display}")
+            
+        period_label = facts_data.get("period_label", "")
+        if period_label:
+            content_parts.append(f"Period: {period_label}")
+        
+        content = " | ".join(content_parts) if content_parts else str(facts_data)
+        
+        return cls(
+            document_id=f"{facts_data.get('ticker', 'UNKNOWN')}_{facts_data.get('accno', '')}_{qname}",
+            content=content,
+            metadata=facts_data,
+            ticker=facts_data.get("ticker"),
+            form_type=facts_data.get("form"),
+            fiscal_year=facts_data.get("fy"),
+            fiscal_quarter=facts_data.get("fq")
+        )
+    
+    @classmethod
+    def from_table_data(cls, table_path: Path, table_metadata: Dict[str, Any] = None) -> 'FinancialDocument':
+        """从表格数据创建文档"""
+        try:
+            # 简单读取CSV文件的前几行作为内容预览
+            content_lines = []
+            with table_path.open('r', encoding='utf-8') as f:
+                for i, line in enumerate(f):
+                    if i >= 10:  # 只读前10行
+                        break
+                    content_lines.append(line.strip())
+            
+            content = f"Table from {table_path.name}:\n" + "\n".join(content_lines)
+            
+            metadata = table_metadata or {}
+            metadata.update({
+                "source_type": "table",
+                "source_path": str(table_path)
+            })
+            
+            return cls(
+                document_id=f"table_{table_path.stem}",
+                content=content,
+                metadata=metadata,
+                ticker=metadata.get("ticker"),
+                form_type=metadata.get("form"),
+                fiscal_year=metadata.get("fy"),
+                fiscal_quarter=metadata.get("fq")
+            )
+        except Exception as e:
+            logger.error(f"Failed to load table {table_path}: {e}")
+            return cls(
+                document_id=f"table_{table_path.stem}_error",
+                content=f"Failed to load table: {e}",
+                metadata={"error": str(e), "source_path": str(table_path)}
+            )
 
 
 class FinancialDataAdapter:
-    """Adapter to convert existing financial data formats to AIE framework format"""
+    """
+    财务数据适配器
+    统一处理不同来源的财务数据，专门为数值检索任务优化
+    """
     
-    def __init__(self, data_root: str = "data"):
+    def __init__(self, data_root: Union[str, Path] = "data"):
         self.data_root = Path(data_root)
+        self.chunked_dir = self.data_root / "chunked"
+        self.processed_dir = self.data_root / "processed" 
+        self.tables_dir = self.data_root / "compact_tables"
+        
+        logger.info(f"FinancialDataAdapter initialized with data_root: {self.data_root}")
+    
+    def load_text_chunks(self, 
+                        ticker: Optional[str] = None,
+                        year: Optional[int] = None,
+                        form_type: Optional[str] = None,
+                        limit: Optional[int] = None) -> Iterator[FinancialDocument]:
+        """
+        加载文本块数据 - 最适合数值检索任务
+        
+        Args:
+            ticker: 股票代码过滤
+            year: 年份过滤
+            form_type: 表单类型过滤 (10-K, 10-Q)
+            limit: 限制加载数量
+        """
+        count = 0
+        
+        # 遍历chunked目录
+        search_pattern = "*/*/text_chunks.jsonl"
+        if ticker:
+            search_pattern = f"{ticker}/*/*/text_chunks.jsonl"
+            
+        for jsonl_file in self.chunked_dir.glob(search_pattern):
+            if limit and count >= limit:
+                break
+                
+            # 从路径解析元数据
+            parts = jsonl_file.parts
+            if len(parts) >= 4:
+                file_ticker = parts[-4]
+                file_year = parts[-3]
+                file_form_accno = parts[-2]
+                
+                # 应用过滤器
+                if ticker and file_ticker != ticker:
+                    continue
+                if year and str(year) not in file_year:
+                    continue
+                if form_type and form_type not in file_form_accno:
+                    continue
+            
+            try:
+                with jsonl_file.open('r', encoding='utf-8') as f:
+                    for line in f:
+                        if limit and count >= limit:
+                            break
+                            
+                        try:
+                            chunk_data = json.loads(line.strip())
+                            doc = FinancialDocument.from_text_chunk(chunk_data)
+                            yield doc
+                            count += 1
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Failed to parse line in {jsonl_file}: {e}")
+                            continue
+                            
+            except Exception as e:
+                logger.error(f"Failed to read {jsonl_file}: {e}")
+                continue
+    
+    def load_facts_data(self,
+                       ticker: Optional[str] = None,
+                       year: Optional[int] = None,
+                       form_type: Optional[str] = None,
+                       concept_filter: Optional[str] = None,
+                       limit: Optional[int] = None) -> Iterator[FinancialDocument]:
+        """
+        加载结构化facts数据 - 适合精确数值查询
+        
+        Args:
+            ticker: 股票代码过滤
+            year: 年份过滤
+            form_type: 表单类型过滤
+            concept_filter: 概念过滤（如 'Revenue', 'Assets'）
+            limit: 限制加载数量
+        """
+        count = 0
+        
+        # 遍历processed目录中的facts.jsonl文件
+        search_pattern = "*/*/facts.jsonl"
+        if ticker:
+            search_pattern = f"{ticker}/*/*/facts.jsonl"
+            
+        for jsonl_file in self.processed_dir.glob(search_pattern):
+            if limit and count >= limit:
+                break
+                
+            # 从路径解析元数据
+            parts = jsonl_file.parts
+            if len(parts) >= 4:
+                file_ticker = parts[-4]
+                file_year = parts[-3]
+                file_form_accno = parts[-2]
+                
+                # 应用过滤器
+                if ticker and file_ticker != ticker:
+                    continue
+                if year and str(year) not in file_year:
+                    continue
+                if form_type and form_type not in file_form_accno:
+                    continue
+            
+            try:
+                with jsonl_file.open('r', encoding='utf-8') as f:
+                    for line in f:
+                        if limit and count >= limit:
+                            break
+                            
+                        try:
+                            facts_data = json.loads(line.strip())
+                            
+                            # 应用概念过滤
+                            if concept_filter:
+                                qname = facts_data.get("qname", "").lower()
+                                if concept_filter.lower() not in qname:
+                                    continue
+                            
+                            doc = FinancialDocument.from_facts_data(facts_data)
+                            yield doc
+                            count += 1
+                            
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Failed to parse line in {jsonl_file}: {e}")
+                            continue
+                            
+            except Exception as e:
+                logger.error(f"Failed to read {jsonl_file}: {e}")
+                continue
+    
+    def get_optimal_data_source_for_numeric_retrieval(self) -> str:
+        """
+        为数值检索任务推荐最佳数据源
+        基于分析，text_chunks最适合AIE数值检索
+        """
+        return "text_chunks"
+    
+    def load_documents_for_aie(self,
+                              ticker: Optional[str] = None,
+                              year: Optional[int] = None,
+                              form_type: Optional[str] = None,
+                              limit: Optional[int] = 1000) -> List[FinancialDocument]:
+        """
+        为AIE系统加载最合适的文档数据
+        专门为数值检索任务优化
+        
+        Args:
+            ticker: 股票代码
+            year: 年份
+            form_type: 表单类型
+            limit: 限制数量
+        
+        Returns:
+            文档列表
+        """
+        documents = []
+        
+        logger.info(f"Loading documents for AIE numeric retrieval")
+        
+        try:
+            # 优先使用text_chunks数据，因为它包含完整的上下文
+            docs_iter = self.load_text_chunks(ticker, year, form_type, limit=limit)
+            documents = list(docs_iter)
+            logger.info(f"Loaded {len(documents)} text chunk documents")
+            
+        except Exception as e:
+            logger.error(f"Failed to load text chunks: {e}")
+            # 回退到facts数据
+            try:
+                logger.info("Falling back to facts data")
+                docs_iter = self.load_facts_data(ticker, year, form_type, limit=limit)
+                documents = list(docs_iter)
+                logger.info(f"Loaded {len(documents)} facts documents")
+            except Exception as e2:
+                logger.error(f"Fallback also failed: {e2}")
+        
+        return documents
         
     def load_chunked_documents(self, ticker: str = None, year: str = None, 
                              form_type: str = None, limit: int = None) -> List[FinancialDocument]:
