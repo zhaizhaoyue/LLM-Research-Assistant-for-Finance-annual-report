@@ -432,7 +432,7 @@ def command_query(args: argparse.Namespace) -> None:
         print()
         print(f"{idx}. {rid}{score_str}")
         snippet = rec.get("snippet") or rec.get("text") or rec.get("content") or ""
-        if snippet:
+        if snippet and args.snippet_chars > 0:
             pretty = textwrap.shorten(" ".join(snippet.split()), width=args.snippet_chars, placeholder="...")
             print(f"   Snippet: {pretty}")
         meta = rec.get("meta") or {}
