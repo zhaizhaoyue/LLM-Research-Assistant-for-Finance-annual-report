@@ -97,3 +97,20 @@ This makes it straightforward to write unit tests around individual transformati
 - Directory defaults assume the repository root as the working directory; override paths via CLI flags when running in other environments.
 
 With the pipeline in place you can quickly curate new filings, refresh embeddings, and serve them to downstream retrieval or question-answering components.
+
+
+## Querying the Index
+
+Once the embedding stage has produced data/index/, the CLI can retrieve answers directly:
+
+`ash
+python -m src.cli query   --query "What was Apple's 2022 revenue?"   --index-dir data/index   --chunk-dir data/chunked   --topk 5   --json-out
+`
+
+To add an LLM-generated summary, supply OpenAI-compatible credentials:
+
+`ash
+python -m src.cli query   --query "Summarise management's discussion of inflation risks."   --index-dir data/index   --chunk-dir data/chunked   --llm-base-url https://api.openai.com/v1   --llm-model gpt-4o-mini   --llm-api-key sk-your-key   --json-out
+`
+
+Use --dense-device cuda or --rerank-device cuda if GPU inference is available, and --loose-filters when you want to widen recall before applying ticker/form/year filters.

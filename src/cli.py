@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -34,6 +36,30 @@ python -m src.cli run `
 --embed-output data/index ` 
 --embed-model BAAI/bge-base-en-v1.5 ` 
 --embed-use-title 
+
+
+DO THE FOLLOWING COMMAND TO QUERY THE INDEX:
+
+python -m src.cli query `
+    --query "What was Apple's revenue in FY2024?" `
+    --index-dir data/index `
+    --chunk-dir data/chunked `
+    --ticker AAPL `
+    --form 10-K `
+    --year 2024 `
+    --bm25-topk 400 `
+    --dense-topk 400 `
+    --ce-candidates 256 `
+    --ce-weight 0.7 `
+    --dense-device cuda `
+    --rerank-device cuda `
+    --llm-base-url https://api.deepseek.com/v1 `
+    --llm-model deepseek-chat `
+    --llm-api-key "sk-b4f98bd0609246c2ba28f0eb0ad549ea"
+
+ 
+
+
 '''
 
 
@@ -57,6 +83,8 @@ DEFAULT_INDEX_OUTPUT = Path("data/silver")
 DEFAULT_CHUNK_OUTPUT = Path("data/chunked")
 DEFAULT_EMBED_OUTPUT = Path("data/index")
 
+
+from src.rag.query_pipeline import QueryRequest, run_query as execute_query
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -334,9 +362,92 @@ STAGE_FUNCTIONS = {
 }
 
 
+def command_query(args: argparse.Namespace) -> None:
+    content_dir = Path(args.chunk_dir) if args.chunk_dir else None
+    req = QueryRequest(
+        query=args.query,
+        index_dir=Path(args.index_dir),
+        content_dir=content_dir,
+        bm25_meta=Path(args.bm25_meta) if args.bm25_meta else None,
+        dense_model=args.dense_model,
+        dense_device=args.dense_device,
+        topk=args.topk,
+        bm25_topk=args.bm25_topk,
+        dense_topk=args.dense_topk,
+        ce_candidates=args.ce_candidates,
+        rrf_k=args.rrf_k,
+        rrf_w_bm25=args.w_bm25,
+        rrf_w_dense=args.w_dense,
+        ce_weight=args.ce_weight,
+        rerank_model=args.rerank_model,
+        rerank_device=args.rerank_device,
+        ticker=args.ticker,
+        form=args.form,
+        year=args.year,
+        llm_base_url=args.llm_base_url,
+        llm_model=args.llm_model,
+        llm_api_key=args.llm_api_key,
+        max_context_tokens=args.max_context_tokens,
+        strict_filters=not args.loose_filters,
+    )
+
+    result = execute_query(req)
+
+    payload = {
+        "query": result.query,
+        "records": result.records,
+    }
+    if result.answer is not None:
+        payload["answer"] = result.answer
+
+    if args.json_out:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    print(f"Query: {result.query}")
+    if result.answer is not None:
+        print()
+        print("Answer:")
+        print(result.answer.get("answer") or "")
+        citations = result.answer.get("citations") or []
+        if citations:
+            print()
+            print("Citations:")
+            for cit in citations:
+                rid = cit.get("rid", "<unknown>")
+                quote = cit.get("quote", "")
+                print(f"  - {rid}: {quote}")
+    else:
+        print()
+        print("No LLM answer generated. Provide --llm-base-url/--llm-model/--llm-api-key to enable.")
+
+    if not result.records:
+        print()
+        print("No retrieval hits.")
+        return
+
+    print()
+    print(f"Top {len(result.records)} hits:")
+    for idx, rec in enumerate(result.records, 1):
+        rid = rec.get("id", "<unknown>")
+        score = rec.get("score") or rec.get("rrf_score") or rec.get("dense_score")
+        score_str = f" score={score:.4f}" if isinstance(score, (int, float)) else ""
+        print()
+        print(f"{idx}. {rid}{score_str}")
+        snippet = rec.get("snippet") or rec.get("text") or rec.get("content") or ""
+        if snippet:
+            pretty = textwrap.shorten(" ".join(snippet.split()), width=args.snippet_chars, placeholder="...")
+            print(f"   Snippet: {pretty}")
+        meta = rec.get("meta") or {}
+        if meta:
+            meta_line = ", ".join(f"{k}={v}" for k, v in meta.items() if v is not None)
+            if meta_line:
+                print(f"   Meta: {meta_line}")
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
 
 def run_pipeline(args: argparse.Namespace) -> None:
     stages = parse_stage_list(args.stages)
@@ -387,9 +498,35 @@ def build_parser() -> argparse.ArgumentParser:
     add_chunk_arguments(chunk_parser, alias=True)
     chunk_parser.set_defaults(entry=stage_chunk)
 
-    embed_parser = subparsers.add_parser("embed", help="Build vector index from chunked data")
-    add_embed_arguments(embed_parser, alias=True)
-    embed_parser.set_defaults(entry=stage_embed)
+
+    query_parser = subparsers.add_parser("query", help="Run retrieval and optional LLM answering")
+    query_parser.add_argument("--query", required=True, help="Natural language question")
+    query_parser.add_argument("--index-dir", default=str(DEFAULT_EMBED_OUTPUT), help="Directory containing FAISS index and metadata")
+    query_parser.add_argument("--chunk-dir", default=str(DEFAULT_CHUNK_OUTPUT), help="Directory with chunked text used for BM25/snippet lookup")
+    query_parser.add_argument("--bm25-meta", help="Override meta.jsonl path")
+    query_parser.add_argument("--topk", type=int, default=8, help="Number of fused results to return")
+    query_parser.add_argument("--bm25-topk", type=int, default=200, help="Candidates fetched from BM25 retriever")
+    query_parser.add_argument("--dense-topk", type=int, default=200, help="Candidates fetched from dense retriever")
+    query_parser.add_argument("--ce-candidates", type=int, default=256, help="Candidates reranked by cross-encoder")
+    query_parser.add_argument("--ce-weight", type=float, default=0.5, help="Weight assigned to cross-encoder scores")
+    query_parser.add_argument("--rrf-k", type=float, default=60.0, help="Reciprocal rank fusion constant")
+    query_parser.add_argument("--w-bm25", type=float, default=2.0, help="Weight for BM25 scores before fusion")
+    query_parser.add_argument("--w-dense", type=float, default=2.0, help="Weight for dense scores before fusion")
+    query_parser.add_argument("--dense-model", default="BAAI/bge-base-en-v1.5", help="SentenceTransformers model for dense retrieval")
+    query_parser.add_argument("--dense-device", default="cpu", help="Device for dense encoder (e.g., cpu, cuda, cuda:0)")
+    query_parser.add_argument("--rerank-model", default="cross-encoder/ms-marco-MiniLM-L-6-v2", help="Cross-encoder model name")
+    query_parser.add_argument("--rerank-device", default=None, help="Device for cross-encoder reranker")
+    query_parser.add_argument("--ticker", help="Filter by ticker symbol")
+    query_parser.add_argument("--form", help="Filter by filing form")
+    query_parser.add_argument("--year", type=int, help="Filter by filing year")
+    query_parser.add_argument("--llm-base-url", help="OpenAI-compatible base URL for the answering model")
+    query_parser.add_argument("--llm-model", help="LLM model identifier")
+    query_parser.add_argument("--llm-api-key", help="API key for the answering model")
+    query_parser.add_argument("--max-context-tokens", type=int, default=2400, help="Maximum tokens to feed into the LLM context")
+    query_parser.add_argument("--snippet-chars", type=int, default=240, help="Number of characters to display per snippet when not using --json-out")
+    query_parser.add_argument("--loose-filters", action="store_true", help="Apply filters only after retrieval (may increase recall)")
+    query_parser.add_argument("--json-out", action="store_true", help="Emit full JSON instead of human-readable text")
+    query_parser.set_defaults(entry=command_query)
 
     return parser
 
