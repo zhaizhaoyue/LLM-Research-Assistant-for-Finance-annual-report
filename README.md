@@ -19,7 +19,6 @@ All seven stages can be orchestrated from the new src/cli.py interface.
 ## Quick Start
 
 1. **Install dependencies**
-   `ash
    python -m venv .venv
    .venv\Scripts\activate  # PowerShell on Windows
    pip install -r requirements.txt
@@ -32,7 +31,6 @@ All seven stages can be orchestrated from the new src/cli.py interface.
    The same value can also be supplied with --download-email when running the CLI.
 
 3. **Run the full pipeline**
-   `ash
    python src/cli.py run --stages download,postprocess,parse,clean,index,chunk,embed      --download-email your-email@example.com
    `
 
@@ -41,12 +39,10 @@ The command uses the default directory layout under data/ and will stream logs f
 ## CLI Highlights
 
 ### Inspect available commands
-`ash
 python src/cli.py --help
 `
 
 ### Run a single stage
-`ash
 # Only chunk existing silver outputs
 python src/cli.py chunk --input data/silver --output data/chunked --chunk-workers 4
 
@@ -57,7 +53,7 @@ python src/cli.py embed --embed-model BAAI/bge-small-en-v1.5 --embed-use-title
 ### Customize a pipeline run
 You can pass any stage option to 
 un. For example, to fetch only the latest 10-K and skip XBRL downloads:
-`ash
+
 python src/cli.py run   --download-email your-email@example.com   --download-limit-10k 1   --download-no-xbrl   --stages download,postprocess,parse
 `
 
@@ -86,7 +82,7 @@ Every module exposes a callable entry point that mirrors the CLI:
 - 	ext_clean.clean_directory(...)
 - schema.process_tree(...)
 - chunking1.chunk_one_file(...)
-- mbedding.build_index(...)
+- mbedding.build_index(...)
 
 This makes it straightforward to write unit tests around individual transformations or to embed the pipeline inside a larger orchestration framework.
 
@@ -103,13 +99,13 @@ With the pipeline in place you can quickly curate new filings, refresh embedding
 
 Once the embedding stage has produced data/index/, the CLI can retrieve answers directly:
 
-`ash
+`
 python -m src.cli query   --query "What was Apple's 2022 revenue?"   --index-dir data/index   --chunk-dir data/chunked   --topk 5   --json-out
 `
 
 To add an LLM-generated summary, supply OpenAI-compatible credentials:
 
-`ash
+`
 python -m src.cli query   --query "Summarise management's discussion of inflation risks."   --index-dir data/index   --chunk-dir data/chunked   --llm-base-url https://api.openai.com/v1   --llm-model gpt-4o-mini   --llm-api-key sk-your-key   --json-out
 `
 
