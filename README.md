@@ -1,114 +1,66 @@
-# Multi-Modal-LLM-Research-Assistant-for-Finance
+# SEC Filing Retrieval Pipeline
 
-This repository powers a financial text-retrieval pipeline that turns raw SEC filings into a searchable vector index. The tooling focuses on repeatable ingestion, parsing, cleaning, chunking, and embedding of US corporate reports so they can be consumed by an LLM-based research assistant.
+A lean, stage-oriented workflow that turns raw SEC filings into a searchable vector index and answers financial questions with hybrid retrieval plus optional LLMs. All stages are scriptable from a single CLI and can be run independently.
 
-## Pipeline Overview
+## Features
+- End-to-end pipeline: download → postprocess → parse → clean → index → chunk → embed.
+- Hybrid search: BM25 + dense retrieval with optional cross-encoder rerank, exposed via `python -m src.cli query`.
+- Reproducible CLI with per-stage flags and sensible defaults for data locations.
+- Windows-friendly; no container required (Dockerfile included for Linux users).
+- Optional XBRL numeric pipeline (requires the AIE numeric module; guarded if absent).
 
-| Stage | Script | Input -> Output | Purpose |
+## Pipeline Stages
+| Stage | Entry point | Input → Output | Purpose |
 | --- | --- | --- | --- |
-| 1. download | src/ingest/download.py | data/companies.csv -> data/raw_reports/sec-edgar-filings/ | Pull the latest 10-K/10-Q filings from EDGAR. |
-| 2. postprocess | src/parse/postprocess.py | data/raw_reports/sec-edgar-filings/ -> data/raw_reports/standard/ | Normalize folder names and collect the primary HTML/XBRL payloads. |
-| 3. parse | src/parse/text.py | data/raw_reports/standard/ -> data/processed/ | Extract structured metadata and generate text.jsonl chunks. |
-| 4. clean | src/cleaning/text.py | data/processed/ -> data/clean/ | Sentence-level cleaning with numeric extraction helpers. |
-| 5. index | src/index/schema.py | data/clean/ -> data/silver/ | Validate against Pydantic schemas and emit clean “silver” records. |
-| 6. chunk | src/chunking/chunk.py | data/silver/ -> data/chunked/ | Build retrieval-ready text chunks with heading context. |
-| 7. embed | src/chunking/embedding.py | data/chunked/ -> data/index/ | Encode chunks, build the FAISS index, and write metadata/id maps. |
-
-All seven stages can be orchestrated from the new src/cli.py interface.
+| download | `src/ingest/download.py` | data/companies.csv → data/raw_reports/sec-edgar-filings/ | Fetch latest 10-K/10-Q filings from EDGAR. |
+| postprocess | `src/parse/postprocess.py` | raw_reports/sec-edgar-filings/ → raw_reports/standard/ | Normalize folder names, collect HTML/XBRL payloads. |
+| parse | `src/parse/text.py` | raw_reports/standard/ → data/processed/ | Extract metadata and produce `text.jsonl`. |
+| clean | `src/cleaning/text.py` | data/processed/ → data/clean/ | Sentence-level cleaning with numeric helpers. |
+| index | `src/index/schema.py` | data/clean/ → data/silver/ | Validate and emit “silver” records. |
+| chunk | `src/chunking/chunk.py` | data/silver/ → data/chunked/ | Build retrieval-ready text chunks with headings. |
+| embed | `src/chunking/embedding.py` | data/chunked/ → data/index/ | Encode chunks, build FAISS index, write id/meta maps. |
 
 ## Quick Start
+1) Install deps  
+```bash
+python -m venv .venv
+.venv\Scripts\activate   # PowerShell on Windows
+pip install -r requirements.txt
+```
+2) Set your SEC email (required for downloads)  
+`$env:SEC_EMAIL="your-email@example.com"`
+3) Run the full pipeline  
+```bash
+python -m src.cli run --stages download,postprocess,parse,clean,index,chunk,embed --download-email $env:SEC_EMAIL
+```
 
-1. **Install dependencies**
-   python -m venv .venv
-   .venv\Scripts\activate  # PowerShell on Windows
-   pip install -r requirements.txt
-   `
-
-2. **Provide EDGAR credentials**
-   `powershell
-   ="your-email@example.com"
-   `
-   The same value can also be supplied with --download-email when running the CLI.
-
-3. **Run the full pipeline**
-   python src/cli.py run --stages download,postprocess,parse,clean,index,chunk,embed      --download-email your-email@example.com
-   `
-
-The command uses the default directory layout under data/ and will stream logs for each stage.
-
-## CLI Highlights
-
-### Inspect available commands
-python src/cli.py --help
-`
-
-### Run a single stage
-# Only chunk existing silver outputs
-python src/cli.py chunk --input data/silver --output data/chunked --chunk-workers 4
-
-# Rebuild embeddings with a different model
-python src/cli.py embed --embed-model BAAI/bge-small-en-v1.5 --embed-use-title
-`
-
-### Customize a pipeline run
-You can pass any stage option to 
-un. For example, to fetch only the latest 10-K and skip XBRL downloads:
-
-python src/cli.py run   --download-email your-email@example.com   --download-limit-10k 1   --download-no-xbrl   --stages download,postprocess,parse
-`
+## CLI Cheat Sheet
+- Inspect commands: `python -m src.cli --help`
+- Single stage: `python -m src.cli chunk --input data/silver --output data/chunked --chunk-workers 4`
+- Rebuild embeddings with a different model: `python -m src.cli embed --embed-model BAAI/bge-small-en-v1.5 --embed-use-title`
+- Query the index:  
+```bash
+python -m src.cli query \
+  --query "What was Apple's 2022 revenue?" \
+  --index-dir data/index \
+  --chunk-dir data/chunked \
+  --bm25-topk 400 --dense-topk 400 --ce-candidates 256 --ce-weight 0.7
+```
+Add `--llm-base-url`, `--llm-model`, and provide an API key when prompted to enable LLM answers.
 
 ## Data Flow
+`data/companies.csv → data/raw_reports/sec-edgar-filings/ → data/raw_reports/standard/ → data/processed/ → data/clean/ → data/silver/ → data/chunked/ → data/index/`
 
-`
-data/companies.csv
-  -> data/raw_reports/sec-edgar-filings/
-  -> data/raw_reports/standard/
-  -> data/processed/
-  -> data/clean/
-  -> data/silver/
-  -> data/chunked/
-  -> data/index/
-`
+## Config Notes
+- Default paths live in `src/cli.py`; override any stage via CLI flags.
+- Downloads respect SEC rate limits; tune `--download-sleep`.
+- Chunk/embedding preferences can be steered with `--chunk-max-tokens`, `--chunk-max-chars`, `--embed-model`, and `--embed-prefer-keywords`.
 
-Each directory is safe to cache between runs; the CLI only overwrites data when the relevant --*-overwrite flag is provided.
+## Tests
+Run the retrieval smoke test:  
+```bash
+pytest tests/test_query_pipeline.py
+```
 
-## Testing the Stages
-
-Every module exposes a callable entry point that mirrors the CLI:
-
-- download.run(...)
-- postprocess.run(...)
-- 	text.batch_parse(...)
-- 	text.clean_directory(...)
-- schema.process_tree(...)
-- chunk.chunk_one_file(...)
-- embedding.build_index(...)
-
-This makes it straightforward to write unit tests around individual transformations or to embed the pipeline inside a larger orchestration framework.
-
-## Notes
-
-- The ingest step respects EDGAR rate limits; adjust --download-sleep to stay compliant with SEC guidance.
-- The embedding stage loads FAISS and sentence-transformers lazily to keep imports fast when you only need upstream stages.
-- Directory defaults assume the repository root as the working directory; override paths via CLI flags when running in other environments.
-
-With the pipeline in place you can quickly curate new filings, refresh embeddings, and serve them to downstream retrieval or question-answering components.
-
-
-## Querying the Index
-
-Once the embedding stage has produced data/index/, the CLI can retrieve answers directly:
-
-`
-python -m src.cli query   --query "What was Apple's 2022 revenue?"   --index-dir data/index   --chunk-dir data/chunked   --topk 5   --json-out
-`
-
-To add an LLM-generated summary, supply the model details and enter the API key interactively when prompted:
-
-`
-python -m src.cli query   --query "Summarise management's discussion of inflation risks."   --index-dir data/index   --chunk-dir data/chunked   --llm-base-url https://api.openai.com/v1   --llm-model gpt-4o-mini   --json-out
-`
-
-Use --dense-device cuda or --rerank-device cuda if GPU inference is available, and --loose-filters when you want to widen recall before applying ticker/form/year filters.
-
-
+## Optional: XBRL Numeric Pipeline
+The XBRL numeric pipeline (`src/xbrl_pipeline/`) depends on `src/aie_for_numeric_retrieval`, which is currently absent. Reinstall that module to enable numeric QA; otherwise the import guard will raise a clear error.
