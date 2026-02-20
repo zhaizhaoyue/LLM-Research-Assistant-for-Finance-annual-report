@@ -79,6 +79,7 @@ STAGE_SEQUENCE: Sequence[str] = (
     "postprocess",
     "parse",
     "clean",
+    "ner",
     "index",
     "chunk",
     "embed",
@@ -90,6 +91,7 @@ DEFAULT_POSTPROCESS_BASE = DEFAULT_DOWNLOAD_OUTDIR / "sec-edgar-filings"
 DEFAULT_POSTPROCESS_OUT = Path("data/raw_reports/standard")
 DEFAULT_PARSE_OUTPUT = Path("data/processed")
 DEFAULT_CLEAN_OUTPUT = Path("data/clean")
+DEFAULT_NER_OUTPUT = Path("data/ner")
 DEFAULT_INDEX_OUTPUT = Path("data/silver")
 DEFAULT_CHUNK_OUTPUT = Path("data/chunked")
 DEFAULT_EMBED_OUTPUT = Path("data/index")
@@ -190,6 +192,28 @@ def add_clean_arguments(parser: argparse.ArgumentParser, *, alias: bool = False)
                        help="Heartbeat logging interval (default: 1000 lines)")
     parser.add_argument("--clean-log-level", dest="clean_log_level", default="INFO",
                        help="Logging level for cleaning (default: INFO)")
+
+
+def add_ner_arguments(parser: argparse.ArgumentParser, *, alias: bool = False) -> None:
+    flags_in = ["--ner-input"]
+    flags_out = ["--ner-output"]
+    if alias:
+        flags_in.append("--input")
+        flags_out.append("--output")
+    parser.add_argument(*flags_in, dest="ner_input", default=str(DEFAULT_CLEAN_OUTPUT),
+                       help="Input directory for NER (default: data/clean)")
+    parser.add_argument(*flags_out, dest="ner_output", default=str(DEFAULT_NER_OUTPUT),
+                       help="Output directory for NER (default: data/ner)")
+    parser.add_argument("--ner-model", dest="ner_model", default="dslim/bert-base-NER",
+                       help="HuggingFace NER model name (default: dslim/bert-base-NER)")
+    parser.add_argument("--ner-device", type=int, dest="ner_device", default=-1,
+                       help="Device: -1=CPU, 0+=CUDA GPU (default: -1)")
+    parser.add_argument("--ner-batch-size", type=int, dest="ner_batch_size", default=32,
+                       help="Batch size for NER inference (default: 32)")
+    parser.add_argument("--ner-confidence", type=float, dest="ner_confidence", default=0.5,
+                       help="Minimum entity confidence threshold (default: 0.5)")
+    parser.add_argument("--ner-workers", type=int, dest="ner_workers", default=1,
+                       help="Parallel file workers (default: 1)")
 
 
 def add_index_arguments(parser: argparse.ArgumentParser, *, alias: bool = False) -> None:
@@ -301,11 +325,30 @@ def stage_clean(args: argparse.Namespace) -> None:
     )
 
 
+def stage_ner(args: argparse.Namespace) -> None:
+    from src.ner.process import process_tree
+    process_tree(
+        input_dir=args.ner_input,
+        output_dir=args.ner_output,
+        model_name=args.ner_model,
+        device=args.ner_device,
+        batch_size=args.ner_batch_size,
+        confidence_threshold=args.ner_confidence,
+        workers=args.ner_workers,
+    )
+
+
 def stage_index(args: argparse.Namespace) -> None:
     from src.index import schema
 
+    # If NER output directory exists and has data, use it as input
+    input_dir = args.index_input
+    ner_dir = Path(getattr(args, "ner_output", "data/ner"))
+    if ner_dir.exists() and any(ner_dir.rglob("*.jsonl")):
+        input_dir = str(ner_dir)
+
     schema.process_tree(
-        in_root=Path(args.index_input),
+        in_root=Path(input_dir),
         out_root=Path(args.index_output),
         export_format=args.index_format,
         overwrite=args.index_overwrite,
@@ -368,6 +411,7 @@ STAGE_FUNCTIONS = {
     "postprocess": stage_postprocess,
     "parse": stage_parse,
     "clean": stage_clean,
+    "ner": stage_ner,
     "index": stage_index,
     "chunk": stage_chunk,
     "embed": stage_embed,
@@ -464,6 +508,18 @@ def command_query(args: argparse.Namespace) -> None:
         #         if meta_line:
         #             print(f"   Meta: {meta_line}")
 
+def command_serve(args: argparse.Namespace) -> None:
+    import uvicorn
+    print(f"Starting SEC Filing NER API on {args.host}:{args.port}")
+    print(f"Swagger UI: http://{args.host}:{args.port}/docs")
+    uvicorn.run(
+        "src.api.app:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -489,6 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_postprocess_arguments(run_parser)
     add_parse_arguments(run_parser)
     add_clean_arguments(run_parser)
+    add_ner_arguments(run_parser)
     add_index_arguments(run_parser)
     add_chunk_arguments(run_parser)
     add_embed_arguments(run_parser)
@@ -510,6 +567,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_clean_arguments(clean_parser, alias=True)
     clean_parser.set_defaults(entry=stage_clean)
 
+    ner_parser = subparsers.add_parser("ner", help="Run NER entity extraction on cleaned text")
+    add_ner_arguments(ner_parser, alias=True)
+    ner_parser.set_defaults(entry=stage_ner)
+
     index_parser = subparsers.add_parser("index", help="Convert clean outputs into schema-validated silver data")
     add_index_arguments(index_parser, alias=True)
     index_parser.set_defaults(entry=stage_index)
@@ -518,6 +579,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_chunk_arguments(chunk_parser, alias=True)
     chunk_parser.set_defaults(entry=stage_chunk)
 
+
+    serve_parser = subparsers.add_parser("serve", help="Launch FastAPI server for NER entity services")
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
+    serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
+    serve_parser.set_defaults(entry=command_serve)
 
     query_parser = subparsers.add_parser("query", help="Run retrieval and optional LLM answering")
     query_parser.add_argument("--query", required=True, help="Natural language question")

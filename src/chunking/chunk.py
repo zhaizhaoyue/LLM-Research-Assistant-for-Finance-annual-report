@@ -77,12 +77,13 @@ def load_rows(path: Path) -> List[Dict[str, Any]]:
 
 def group_by_heading(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sections: List[Dict[str, Any]] = []
-    cur_h, cur_paras, cur_meta = None, [], {}
+    cur_h, cur_paras, cur_meta, cur_rows = None, [], {}, []
     def commit():
-        nonlocal cur_h, cur_paras, cur_meta
+        nonlocal cur_h, cur_paras, cur_meta, cur_rows
         if cur_paras:
-            sections.append({"heading": cur_h, "paras": cur_paras[:], "meta_base": cur_meta.copy()})
-        cur_h, cur_paras, cur_meta = None, [], {}
+            sections.append({"heading": cur_h, "paras": cur_paras[:],
+                             "meta_base": cur_meta.copy(), "rows": cur_rows[:]})
+        cur_h, cur_paras, cur_meta, cur_rows = None, [], {}, []
     for r in rows:
         h = r.get("heading")
         t = (r.get("text") or "").strip()
@@ -95,8 +96,30 @@ def group_by_heading(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ]}
         if t:
             cur_paras.append(t)
+        cur_rows.append(r)
     commit()
     return sections
+
+
+def _merge_entities_for_chunk(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge entity annotations from multiple rows into chunk-level metadata."""
+    entity_map: Dict[str, set] = {}
+    for row in rows:
+        for ent in (row.get("entities") or []):
+            label = ent.get("label", "MISC")
+            normalized = ent.get("normalized", ent.get("text", ""))
+            key = f"entities_{label.lower()}"
+            entity_map.setdefault(key, set()).add(normalized)
+
+    result: Dict[str, Any] = {}
+    all_labels: set = set()
+    for key, values in entity_map.items():
+        result[key] = sorted(values)
+        label = key.replace("entities_", "").upper()
+        all_labels.add(label)
+    if all_labels:
+        result["entity_labels"] = sorted(all_labels)
+    return result
 
 def emit_chunks_from_paragraphs(
     paras: List[str],
@@ -209,6 +232,7 @@ def chunk_one_file(in_path: Path, out_path: Path, max_tokens: int, max_chars: in
     )
     for sec in sections:
         heading, paras, meta_b = sec["heading"], sec["paras"], sec["meta_base"]
+        sec_entity_meta = _merge_entities_for_chunk(sec.get("rows", []))
         local_blocks: List[str] = []
         emit_chunks_from_paragraphs(
             paras,
@@ -255,6 +279,8 @@ def chunk_one_file(in_path: Path, out_path: Path, max_tokens: int, max_chars: in
                 "section_tag": sec_tag,
                 "mentions_other_years": _mentions_other_years(content),
             }
+            # Merge NER entity metadata (if available)
+            meta.update(sec_entity_meta)
 
             chunks.append({
                 "id": chunk_id,

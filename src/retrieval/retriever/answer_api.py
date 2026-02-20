@@ -275,6 +275,9 @@ def pack_evidence(records: List[Dict[str, Any]],
         # Cross-year mention prior
         if m.get("mentions_other_years"):
             s *= 0.90
+        # Entity richness boost: chunks with recognized entities get a small bonus
+        if m.get("entity_labels"):
+            s *= 1.03
         return s
 
     def _tok_est(s: str) -> int:

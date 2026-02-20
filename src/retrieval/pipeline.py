@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -9,6 +10,53 @@ from src.retrieval.retriever.bm25_text import BM25TextConfig
 from src.retrieval.retriever.dense import DenseRetriever
 from src.retrieval.retriever.hybrid import HybridRetrieverRRF, CrossEncoderReranker
 from src.retrieval.retriever.answer_api import LLMClient, answer_with_llm
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Query-side NER: extract entities from user query for filter/boost
+# ---------------------------------------------------------------------------
+_query_ner = None
+
+
+def _extract_query_entities(query: str) -> dict:
+    """Extract entities from user query for filter/boost.
+
+    Returns dict with keys: orgs, dates, gpes, tickers, fin_metrics
+    """
+    global _query_ner
+    result: dict = {"orgs": [], "dates": [], "gpes": [], "tickers": [], "fin_metrics": []}
+
+    entities = []
+    try:
+        if _query_ner is None:
+            from src.ner.recognizer import NERRecognizer
+            _query_ner = NERRecognizer(device=-1, batch_size=1)
+        entities = _query_ner.recognize(query)
+    except Exception as e:
+        log.debug("Query NER model unavailable: %s", e)
+
+    # Also extract custom finance entities
+    try:
+        from src.ner.fin_entities import extract_custom_entities
+        entities.extend(extract_custom_entities(query))
+    except Exception:
+        pass
+
+    for ent in entities:
+        label = ent.get("label", "")
+        text = ent.get("text", "")
+        if label == "ORG":
+            result["orgs"].append(text)
+        elif label == "DATE":
+            result["dates"].append(text)
+        elif label == "GPE":
+            result["gpes"].append(text)
+        elif label == "TICKER":
+            result["tickers"].append(text)
+        elif label == "FIN_METRIC":
+            result["fin_metrics"].append(text)
+    return result
 
 
 @dataclass
@@ -44,6 +92,7 @@ class QueryResult:
     query: str
     records: List[Dict[str, Any]]
     answer: Optional[Dict[str, Any]]
+    query_entities: Optional[Dict[str, list]] = None
 
 
 def _build_hybrid(req: QueryRequest) -> HybridRetrieverRRF:
@@ -87,6 +136,9 @@ def run_query(req: QueryRequest) -> QueryResult:
     if content_dir is not None and not content_dir.exists():
         raise FileNotFoundError(f"Chunk directory not found: {content_dir}")
 
+    # Extract entities from user query
+    query_entities = _extract_query_entities(req.query)
+
     hybrid = _build_hybrid(req)
 
     filters: Dict[str, Any] = {}
@@ -108,6 +160,14 @@ def run_query(req: QueryRequest) -> QueryResult:
         **filters,
     )
 
+    # Apply entity overlap boost to records
+    if query_entities and any(query_entities.values()):
+        for rec in records:
+            meta = rec.get("meta", {}) or {}
+            boost = _entity_overlap_boost(query_entities, meta)
+            if boost > 0 and "final_score" in rec:
+                rec["final_score"] = rec["final_score"] * (1.0 + boost)
+
     answer: Optional[Dict[str, Any]] = None
     if req.llm_base_url and req.llm_model and req.llm_api_key:
         llm = LLMClient(
@@ -122,4 +182,26 @@ def run_query(req: QueryRequest) -> QueryResult:
             max_ctx_tokens=req.max_context_tokens,
         )
 
-    return QueryResult(query=req.query, records=records, answer=answer)
+    return QueryResult(query=req.query, records=records, answer=answer,
+                       query_entities=query_entities)
+
+
+def _entity_overlap_boost(query_entities: dict, chunk_meta: dict) -> float:
+    """Boost score based on entity overlap between query and chunk."""
+    boost = 0.0
+    query_orgs = {o.upper() for o in query_entities.get("orgs", [])}
+    chunk_orgs = set(chunk_meta.get("entities_org", []))
+    if query_orgs & chunk_orgs:
+        boost += 0.15  # org match +15%
+
+    query_gpes = {g.upper() for g in query_entities.get("gpes", [])}
+    chunk_gpes = set(chunk_meta.get("entities_gpe", []))
+    if query_gpes & chunk_gpes:
+        boost += 0.05  # geo match +5%
+
+    query_tickers = {t.upper() for t in query_entities.get("tickers", [])}
+    chunk_tickers = set(chunk_meta.get("entities_ticker", []))
+    if query_tickers & chunk_tickers:
+        boost += 0.10  # ticker match +10%
+
+    return boost

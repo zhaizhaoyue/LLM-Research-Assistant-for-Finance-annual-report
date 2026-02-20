@@ -132,6 +132,10 @@ class TextChunk(RecordBase):
     statement_hint: Optional[StatementHint] = None
     text: str
 
+    # NER fields (optional, None when NER stage has not been run)
+    entities: Optional[List[Dict]] = None
+    entity_labels: Optional[List[str]] = None
+
 class TextChunkInput(TextChunk):
     model_config = ConfigDict(extra="ignore")
     @model_validator(mode="before")

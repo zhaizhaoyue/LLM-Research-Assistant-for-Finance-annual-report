@@ -249,6 +249,16 @@ class BM25TextRetriever:
 
         bm25 = BM25Index(docs_tokens, k1=self.cfg.k1, b=self.cfg.b)
         q_tokens = tokenize(query, min_len=self.cfg.min_token_len)
+
+        # NER-based query expansion: inject entity tokens
+        try:
+            from src.ner.fin_entities import extract_custom_entities
+            for ent in extract_custom_entities(query):
+                extra = tokenize(ent["text"], min_len=1)
+                q_tokens.extend(extra)
+        except Exception:
+            pass
+
         base_scores = bm25.scores(q_tokens)
 
         results = [(i, s) for i,s in enumerate(base_scores) if s > 0.0]
